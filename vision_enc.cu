@@ -6,7 +6,6 @@
 #include <vector>
 #include <string>
 #include <cmath>
-#include <ctime>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
@@ -21,7 +20,6 @@ __device__ __forceinline__ bf16 f2b(float x){return __float2bfloat16(x);}
 #define CB(x) do{cublasStatus_t s=(x);if(s){fprintf(stderr,"cublas %s:%d %d\n",__FILE__,__LINE__,s);exit(1);} }while(0)
 static const int IMG=1024,PATCH=16,GS=64,C=768,NH=12,HD=64,MLP=3072,WIN=14;
 static cublasHandle_t CUB; static SafeTensors ST;
-static const float ONE=1.f,ZERO=0.f;
 static float* g_dimg; static cudaStream_t VS;  // declared early (used in render_preprocess)
 
 // ---- MuPDF render + GPU aspect-pad resize + normalize (pixel/127.5-1) -> [3,1024,1024] ----
@@ -62,7 +60,6 @@ static float* W(const std::string& nm){   // small params (LN, bias, rel_pos): c
     CK(cudaMemcpy(g_stage,t.data,n*2,cudaMemcpyHostToDevice));
     float* d; CK(cudaMalloc(&d,n*4)); k_bf16f32<<<(n+255)/256,256>>>(g_stage,d,n); return d;
 }
-static size_t numel(const std::string& nm){const Tensor&t=ST.get(nm);size_t n=1;for(long d:t.shape)n*=d;return n;}
 
 // ---- kernels (bf16 activations, fp32 accum; small params fp32) ----
 static const float ONE_=1.f,ZERO_=0.f;
@@ -423,9 +420,6 @@ static double cmp_gd(const char* fn,const bf16* dev,size_t n){
         __bfloat162float(mb[0]),__bfloat162float(mb[1]),__bfloat162float(mb[2]),ref[0],ref[1],ref[2]);
     return md;
 }
-static bf16 *POS40_t,*POSC100_t;
-static bf16 g_dummy;
-static bf16 g_vinit_done;
 static bool g_vinit=false;
 void init_vision(){
     if(g_vinit)return; g_vinit=true;
@@ -563,7 +557,7 @@ static void gundam_ratio(float pw,float ph,int* ow,int* oh){
     *ow=bw;*oh=bh;
 }
 __global__ void k_gundam_tiles(const unsigned char* src,int sw,int w,float* out){    // src[sh,sw,3] -> out[P,3,640,640]
-    size_t i=(size_t)blockIdx.x*256+threadIdx.x; size_t TOT=(size_t)gridDim.x*256; // bound checked by caller via P
+    size_t i=(size_t)blockIdx.x*256+threadIdx.x; // bound checked by caller via P (grid sized to P*3*640*640)
     int x=i%640; size_t t=i/640; int y=t%640; t/=640; int c=t%3; int p=t/3;
     int row=p/w, col=p%w; int sy=row*640+y, sx=col*640+x;
     out[((size_t)(p*3+c)*640+y)*640+x]=src[((size_t)sy*sw+sx)*3+c]/127.5f-1.f;

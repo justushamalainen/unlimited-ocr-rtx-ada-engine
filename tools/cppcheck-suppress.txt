@@ -1,0 +1,18 @@
+// cppcheck suppressions — false positives for this single-TU CUDA engine.
+// __global__ kernels and host entry points look "unused" to cppcheck (they're
+// launched via <<<>>> or are the program entry), and CUDA-specific constructs
+// confuse a few checks.
+unusedFunction
+missingIncludeSystem
+unmatchedSuppression
+checkersReport
+// device pointers freed via cudaFree, not delete/free — cppcheck can't track them
+memleak
+memleakOnRealloc
+// cppcheck parses the CUDA kernel-launch syntax `<<<grid,block>>>` as bit-shifts → bogus shift warnings
+shiftTooManyBits
+shiftTooManyBitsSigned
+shiftNegative
+// CUDA launch syntax also trips these
+syntaxError
+internalAstError

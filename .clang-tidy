@@ -1,0 +1,15 @@
+# Best-effort static checks for the CUDA engine (clang-tidy via the CUDA front-end).
+# Focused on real bug classes; readability/naming checks are off (the code uses a
+# deliberately terse, dense style).
+Checks: >
+  bugprone-*,
+  performance-*,
+  clang-analyzer-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -clang-analyzer-security.insecureAPI.*,
+  -performance-avoid-endl
+WarningsAsErrors: ''
+HeaderFilterRegex: 'st_loader\.h$'
+FormatStyle: none

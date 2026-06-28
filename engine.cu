@@ -150,9 +150,7 @@ static void quant_q4(bf16* W,int rows,int cols,uint8_t** W4,float** sc){
     CK(cudaMalloc(W4,(size_t)rows*(cols/2))); CK(cudaMalloc(sc,(size_t)rows*(cols/QG)*4));
     k_quant_rows_q4<<<rows,QG,0,GS>>>(W,*W4,*sc,cols);
 }
-// int4 group-128 lm_head GEMV (float out): out[v]=dot(x, deq_g128(W4[v])); warp/row
-// per-block top-T over the int4 logits -> cand[b*T + k] (candidate token ids). dynamic shared = chunk floats.
-// argmax over candidate fp8 logits -> *out = cand[argmax]. single block.
+// int4 group-128 lm_head GEMV (float out): out[v]=dot(x, deq_g128(W4[v])); warp/row (see k_lmhead_q4_b)
 
 // ---- gemm: Y[S,O] = X[S,Hin] · W[O,Hin]^T  (row-major), bf16 io, fp32 accum ----
 static void lin(const bf16* X,const bf16* W,bf16* Y,int S,int Hin,int O){
@@ -194,8 +192,6 @@ __global__ void k_add_rmsnorm(bf16* x,const bf16* y,const bf16* w,bf16* out,int 
     __syncthreads(); float rstd=rsqrtf(red[0]/Hd+eps);
     for(int i=threadIdx.x;i<Hd;i+=blockDim.x) outr[i]=__float2bfloat16(__bfloat162float(xr[i])*rstd*__bfloat162float(w[i]));
 }
-// fused gate GEMV + softmax + top-K routing (replaces cuBLAS gate call + 1-thread k_route).
-
 // RoPE in place on q/k laid out [S, NH*HD] (head-major within row)
 __global__ void k_rope(bf16* q,bf16* k,int S,int pos0){
     int t=blockIdx.x, h=blockIdx.y, d=threadIdx.x; // d in 0..HD/2-1
@@ -230,14 +226,8 @@ __global__ void k_attn_prefill(const bf16* q,const bf16* k,const bf16* v,bf16* o
         float lg=0,o=0; for(int ww=0;ww<8;ww++){float f=__expf(sm[ww]-mg); lg+=sl[ww]*f; o+=sacc[ww][tid]*f;}
         out[(size_t)i*NH*HD + h*HD + tid]=__float2bfloat16(o/lg); }
 }
-// device-pos variants for graph capture
-// flash-style decode attention: 1 block/head, 8 warps split keys; each lane owns 4 dims
-// (HD=128=4*32), register accumulation, only warp-shuffles in the loop. <<<NH,256>>>.
-#define AW 8
+// device-pos counter for graph-captured decode (incremented once per step; wraps in [lo,hi))
 __global__ void k_incpos(int* pos,int lo,int hi){ if(threadIdx.x==0){ int p=*pos+1; if(p>=hi)p=lo; *pos=p; } }
-// split-KV decode attention: pass1 = NH*NSPLIT blocks (1 warp each) over key-chunks -> partials;
-// pass2 = NH blocks merge. Uses the whole GPU instead of 10 blocks. lane owns 4 dims (HD=128).
-#define NSPLIT 128  // scratch stride / max key-splits per head
 // fused RoPE + KV store: rope q in qkvb (in place), rope k -> kcache[*pos], copy v -> vcache[*pos].
 // qkvb layout [3H]: q=[0,H) k=[H,2H) v=[2H,3H). <<<NH, HD/2>>>.
 // R-SWA: RoPE at absolute position *pos; K/V written to ring slot pf + ((*pos-pf) mod WIN).
@@ -258,11 +248,7 @@ __global__ void k_route(const float* logits,int* idx,float* w,int S){   // block
         bool used[NEXP]; for(int i=0;i<NEXP;i++)used[i]=false;
         for(int k=0;k<TOPK;k++){int b=-1;float bv=-1; for(int i=0;i<NEXP;i++)if(!used[i]&&s[i]>bv){bv=s[i];b=i;} used[b]=true; idx[t*TOPK+k]=b; w[t*TOPK+k]=s[b]/z; } }
 }
-// gate GEMV: glog[e]=dot(x, gateW[e]); warp per expert, multi-block. bf16 in / fp32 accum (== cuBLAS).
-// decode router (single token): parallel softmax over NEXP + top-K. <<<1,NEXP>>>.
-// expert MLP: for each (token t, slot j): e=idx; h=silu(xn·Wg_e)*(xn·Wu_e)[MOEI]; y_t += w * (h·Wd_e)[H]
-// one block per (t,j); blockDim 256. xn in shared.
-// Fast batch-1 MoE: one warp per output row (full occupancy, coalesced weight reads).
+// gate GEMV: glog[e]=dot(x, gateW[e]); warp per expert, multi-block. bf16 in / fp32 accum (== cuBLAS).  (see k_gate_b)
 // out_bf16 = Yf(float experts) + shared(bf16)
 __global__ void k_combine(bf16* out,const float* Yf,const bf16* shared,int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) out[i]=__float2bfloat16(Yf[i]+__bfloat162float(shared[i]));
@@ -318,9 +304,6 @@ static void load_weights(){
 // scratch
 static bf16 *xbuf,*nbuf,*q,*k,*v,*att,*tmp,*mg,*mu,*mh; static float* glog; static int *didx; static float* dw; static float* Yf;
 static kvt *kcache[NL],*vcache[NL]; static int MAXLEN=0; static bf16* qkvb=nullptr; static bf16* gu=nullptr;
-static int g_prefill=0;  // prefill length (set per run)
-static bool g_emit=false; static int* d_out=nullptr; static int* d_outn=nullptr;  // device-side token collection (e2e)
-static const int NBAM=256;  // per-block count for lm_head top-K rescore
 static void alloc(int S){
     size_t sH=(size_t)S*H;
     if(xbuf){ cudaFree(xbuf);cudaFree(nbuf);cudaFree(q);cudaFree(k);cudaFree(v);cudaFree(att);cudaFree(tmp);   // free-first: repeated calls (Gundam per-page) reuse, no leak
@@ -333,7 +316,7 @@ static void alloc(int S){
     CK(cudaMalloc(&qkvb,3*(size_t)H*2)); CK(cudaMalloc(&gu,2*(size_t)DENSEI*2));
 }
 static void mlp_dense(Layer&ly,const bf16* xn,bf16* outY,int S,int interm,bf16* Wg,bf16* Wu,bf16* Wd);
-// MoE/dense block for PREFILL (S>1). Decode uses decode_graph_body.
+// MoE/dense block for PREFILL (S>1). Page-parallel decode uses mlp_block_b.
 // ===== expert-grouped bf16 MoE (prefill): sort tokens by expert -> 1 GEMM/expert (weight read ONCE, tensor cores) =====
 __global__ void k_moe_hist(const int* didx,int* cnt,int S){ long i=(long)blockIdx.x*256+threadIdx.x; if(i<(long)S*TOPK)atomicAdd(&cnt[didx[i]],1); }
 __global__ void k_moe_scat(const int* didx,const int* off,int* cur,int* gtok,int S){
@@ -389,7 +372,7 @@ static void prefill(const int* dids,int S,float* dlogits_last,bool check,std::ve
     if(dembeds && dembeds!=xbuf) CK(cudaMemcpyAsync(xbuf,dembeds,(size_t)S*H*2,cudaMemcpyDeviceToDevice,GS));  // vision/text embeds (skip self-copy if already in xbuf)
     else { dim3 eb((H+255)/256); k_embed<<<dim3(S,eb.x),256,0,GS>>>(EMB,dids,xbuf,S); }
     auto cmp=[&](int idx,const char* tag){ if(!check)return; std::vector<uint16_t> hb((size_t)S*H); CK(cudaMemcpy(hb.data(),xbuf,(size_t)S*H*2,cudaMemcpyDeviceToHost));
-        double md=0,ref=0; auto&f=(*fx)[idx]; for(size_t i=0;i<(size_t)S*H;i++){float g=bf16_to_f32(hb[i]);md=fmax(md,fabs(g-f[i]));ref=fmax(ref,fabs(f[i]));}
+        double md=0,ref=0; auto&f=(*fx)[idx]; for(size_t i=0;i<(size_t)S*H;i++){float g=bf16_to_f32(hb[i]);md=fmax(md,fabsf(g-f[i]));ref=fmax(ref,fabsf(f[i]));}
         printf("  [check] %-10s max_abs=%.4f (ref_absmax=%.3f)\n",tag,md,ref); };
     cmp(0,"embeds");
     for(int l=0;l<NL;l++){ Layer&ly=L[l];
@@ -446,8 +429,6 @@ static std::string bpe_decode(const std::vector<int>& ids){
             auto it=g_bdec.find(cp); if(it!=g_bdec.end())ob.push_back((char)it->second); } }
     return ob;
 }
-// prefill (bf16 embeds) + captured-graph decode -> out token ids (stops at eos=1)
-
 // ===== PAGE-PARALLEL batched decode: N independent single-page streams, R-SWA per stream =====
 // Each page is its own single-page OCR (own 278-tok reference + 128 ring), decoded as a batch-N step.
 // Reuses prefill bf16 kernels (lin/cuBLAS, mlp_block, k_rmsnorm) with S=N; only attention/rope/argmax are new.
@@ -735,6 +716,7 @@ static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& 
     const int MAXSTEP=4096;
     int *d_step,*outbuf,*d_done,*d_act;                              // batch-shrink: d_act maps active slot -> physical stream
     CK(cudaMalloc(&d_step,4)); CK(cudaMalloc(&outbuf,(size_t)N*MAXSTEP*4)); CK(cudaMalloc(&d_done,(size_t)N*4)); CK(cudaMalloc(&d_act,(size_t)N*4));
+    CK(cudaMemset(outbuf,0,(size_t)N*MAXSTEP*4));                    // init: the bulk D2H read below copies all MAXSTEP rows, but only `step` are written (rest read only up to each stream's EOS) — keeps initcheck clean
     int z=0; CK(cudaMemcpy(d_step,&z,4,cudaMemcpyHostToDevice)); CK(cudaMemset(d_done,0,(size_t)N*4));
     std::vector<int> active, curtok;                                 // initial active set = streams whose first token isn't EOS
     for(int p=0;p<N;p++) if(tok0[p]!=1){ active.push_back(p); curtok.push_back(tok0[p]); }
@@ -803,11 +785,10 @@ int main(int argc,char**argv){
     printf("KV cache backend: %s\n", KV_NAME);
     printf("loading weights to GPU...\n"); load_weights(); CK(cudaDeviceSynchronize());
 
-    // ===== OCR (single host thread): ocr_bin [pdf] [npages] [maxtok] =====
-    // Defaults: bundled paper, 1 page. No maxtok -> run to EOS. N pages -> one-shot multi-page parse.
+    // ===== OCR (single host thread): ocr_bin [pdf] [npages] =====
+    // Defaults: bundled paper, 1 page. Decode always runs to EOS (per-page, page-parallel). N pages parsed together.
     const char* pdf = argc>1 ? argv[1] : "/home/janitor/unlimited-ocr/Unlimited-OCR.pdf";
     int N      = argc>2 ? atoi(argv[2]) : 1;
-    int maxtok = argc>3 ? atoi(argv[3]) : 32768;   // no value given -> run to EOS (capped at model max_length)
     if(getenv("GUNDAM")){                                    // ===== Gundam: high-res tiling; BATCHED decode (identical path to Base, vpp=tiles) =====
         extern int gundam_encode(const char* pdf,int page); extern bf16* gundam_result();
         load_vocab("/home/janitor/unlimited-ocr/engine/vocab.bin");

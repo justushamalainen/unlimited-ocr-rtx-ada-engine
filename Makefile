@@ -31,4 +31,16 @@ mupdflib/libmupdf.so:
 clean:
 	rm -f *.o ocr_bin
 
-.PHONY: clean
+# --- analysis / correctness ---
+PDF ?= $(HOME)/unlimited-ocr/Unlimited-OCR.pdf
+
+check: ocr_bin            # build + vision-fixture verify + determinism gate
+	@bash tools/check.sh "$(PDF)"
+
+sanitize: ocr_bin         # compute-sanitizer suite (memcheck/racecheck/initcheck/synccheck); GUNDAM=1 for tiling path
+	@bash tools/sanitize.sh
+
+lint:                     # cppcheck + clang-tidy (no build / no GPU)
+	@bash tools/lint.sh
+
+.PHONY: clean check sanitize lint
