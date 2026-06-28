@@ -1,0 +1,26 @@
+# build artifacts
+*.o
+ocr_bin
+engine_bin
+vision_bin
+vision_enc
+
+# mupdf symlink (Makefile regenerates it from the local pymupdf install)
+mupdflib/
+
+# large, regenerable verification/test fixtures
+vfix/
+fixture/
+viewer/
+gundam/ref_*
+
+# intermediate / scratch data
+embeds*.bin
+toks*.bin
+prompt_*.i32
+manifest.tsv
+
+# profiler output
+*.nsys-rep
+*.sqlite
+*.ncu-rep

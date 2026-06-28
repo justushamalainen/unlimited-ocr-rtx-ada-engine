@@ -1,0 +1,34 @@
+# Unlimited-OCR engine — pure C++/CUDA, single host thread, no Python at runtime.
+# Pipeline: PDF -> MuPDF render -> SAM ViT-B + CLIP-L + projector (vision_enc.cu)
+#           -> DeepseekV2 MoE decoder (engine.cu) -> byte-level BPE -> text.
+# Usage:  make && ./ocr_bin [pdf] [npages] [maxtok]   (defaults: bundled paper, 1 page, run to EOS)
+# Pluggable KV cache:  make KV=fp8   (default KV=bf16) — fp8 e4m3 halves the long-context attention bandwidth.
+
+MUPDF := $(HOME)/unlimited-ocr/.venv/lib/python3.12/site-packages/pymupdf
+NVCC  := nvcc -O3 -arch=sm_89 -std=c++17 --expt-relaxed-constexpr
+INC   := -I$(MUPDF)/mupdf-devel/include
+KV    ?= bf16
+ifeq ($(KV),fp8)
+KVFLAG := -DKV_FP8
+endif
+# rpath so the binary finds libmupdf without LD_LIBRARY_PATH
+LIBS  := -Lmupdflib -lmupdf -lcublas -Xlinker -rpath=$(MUPDF)
+
+ocr_bin: vision_enc.o engine.o mupdflib/libmupdf.so
+	nvcc -arch=sm_89 vision_enc.o engine.o -o $@ $(LIBS)
+
+# vision needs the per-thread default stream so its forward can be CUDA-graph-captured;
+# -DOCR_LINK drops its standalone test main() so engine.cu provides the single main().
+vision_enc.o: vision_enc.cu st_loader.h
+	$(NVCC) -default-stream per-thread -DOCR_LINK -c vision_enc.cu -o $@ $(INC)
+
+engine.o: engine.cu st_loader.h
+	$(NVCC) --expt-extended-lambda $(KVFLAG) -c engine.cu -o $@
+
+mupdflib/libmupdf.so:
+	mkdir -p mupdflib && ln -sf $(MUPDF)/libmupdf.so.27.2 mupdflib/libmupdf.so
+
+clean:
+	rm -f *.o ocr_bin
+
+.PHONY: clean
