@@ -24,3 +24,6 @@ manifest.tsv
 *.nsys-rep
 *.sqlite
 *.ncu-rep
+
+# local session context (box-specific paths + push recipe; auto-loads regardless of git)
+CLAUDE.md
