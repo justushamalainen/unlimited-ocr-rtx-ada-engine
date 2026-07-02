@@ -14,16 +14,20 @@ endif
 # rpath so the binary finds libmupdf without LD_LIBRARY_PATH
 LIBS  := -Lmupdflib -lmupdf -lcublas -Xlinker -rpath=$(MUPDF)
 
-ocr_bin: vision_enc.o engine.o mupdflib/libmupdf.so
-	nvcc -arch=sm_89 vision_enc.o engine.o -o $@ $(LIBS)
+ocr_bin: vision_enc.o engine.o server.o mupdflib/libmupdf.so
+	nvcc -arch=sm_89 vision_enc.o engine.o server.o -o $@ $(LIBS) -lpthread
 
 # vision needs the per-thread default stream so its forward can be CUDA-graph-captured;
 # -DOCR_LINK drops its standalone test main() so engine.cu provides the single main().
 vision_enc.o: vision_enc.cu st_loader.h
 	$(NVCC) -default-stream per-thread -DOCR_LINK -c vision_enc.cu -o $@ $(INC)
 
-engine.o: engine.cu st_loader.h
+engine.o: engine.cu st_loader.h server.h
 	$(NVCC) --expt-extended-lambda $(KVFLAG) -c engine.cu -o $@
+
+# HTTP front-end + job queue (plain C++, zero CUDA/MuPDF — connection threads never touch the GPU)
+server.o: server.cpp server.h
+	$(NVCC) -Xcompiler -pthread -c server.cpp -o $@
 
 mupdflib/libmupdf.so:
 	mkdir -p mupdflib && ln -sf $(MUPDF)/libmupdf.so.27.2 mupdflib/libmupdf.so
@@ -43,4 +47,7 @@ sanitize: ocr_bin         # compute-sanitizer suite (memcheck/racecheck/initchec
 lint:                     # cppcheck + clang-tidy (no build / no GPU)
 	@bash tools/lint.sh
 
-.PHONY: clean check sanitize lint
+servercheck: ocr_bin      # server gate: CLI parity, multi-doc concurrency, gundam interlude, error paths
+	@bash tools/server_check.sh "$(PDF)"
+
+.PHONY: clean check sanitize lint servercheck

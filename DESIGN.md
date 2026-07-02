@@ -513,3 +513,40 @@ it). Fix: keep the exact expression shape (`dstep[act[s]]` swapped in-place for 
 line untouched) -> FP opcode sequence identical (cuobjdump -sass diff) -> gundam-50 md5 restored.
 When touching bit-verified kernels, diff the SASS FP-opcode sequence, and gate on the LONGEST-chain
 workload, not just the fastest one.
+
+## Multi-document server: `ocr_bin serve` (2026-07-02)
+The one-shot CLI became a persistent server by generalizing WHO feeds windowed admission. The decode
+loop was refactored behind a `PageSrc` interface (next/embeds/out/done/wait — hooks run on the engine
+thread at admission/16-step sync boundaries only, never inside graph capture): `FixedSrc` reproduces the
+CLI byte-for-byte (verified: full-binary SASS identical, all 3 md5 gates + gundam-50 bit-exact after the
+refactor), `QueueSrc` feeds pages from an HTTP job queue. Documents ARE just a grouping of pages: pages
+of different documents co-batch in one decode window; per-job round-robin admission (one page per job
+per free slot) keeps a 1-page doc from queueing behind a 500-pager. `server.cpp` is the dependency-free
+HTTP/1.1 front (POST /ocr[?pages=N][&gundam=1] body=PDF -> text/plain; GET /healthz; Expect:100-continue,
+lingering close, strict Content-Length, 16-job/64-conn caps -> 503; spool to $TMPDIR/ocr_srv.<pid>).
+Connection threads never touch CUDA/MuPDF — the engine thread is the sole consumer (MuPDF ctx has NULL
+locks; vision runs on cudaStreamPerThread, so encode must stay on the engine thread forever).
+- **Gundam jobs = exclusive interludes**: per-page vpp is heterogeneous, PF is baked into MS/KV/graphs,
+  so gundam can't share slots. When a gundam job reaches the queue head, QueueSrc stops yielding,
+  residents drain, the core returns, `ocr_gundam()` runs (page cap `GUNDAM_PAGE_CAP`=64 guards the
+  W=N upfront alloc — an uncapped request could OOM->exit(1) the whole server), then the base loop
+  re-enters (fresh scratch + graph recapture, ~0.5s). Bounded head-of-line: base jobs behind a queued
+  gundam wait for it.
+- **Determinism contract**: a job on an IDLE server is byte-identical to the CLI (same NA trajectory;
+  W=wcap vs min(N,wcap) only caps admission — gated by tools/server_check.sh parity stanzas). Under
+  CONCURRENT load, co-batching changes the NA trajectory -> cuBLAS shapes/ns/TCMOE tiling -> argmax
+  near-ties can flip (measured: 12 diff lines on a 515-token page co-batched with 64 other pages).
+  Same numeric class as windowed NA variation; inherent to batched serving (vLLM behaves the same).
+  Do NOT "re-optimize" documents into serialized exclusive runs to erase this — it collapses many-small-
+  doc throughput (NA=1-2 vs co-batched NA<=128).
+- **Robustness**: fz_try wrappers (fzdoc/render/count — previously zero fz_try: corrupt PDF = process
+  abort) fail the job with 422 instead; unrenderable page -> embeds() nullptr -> page skipped, no slot
+  consumed, job 422. Doc handles live in an LRU-8 cache keyed by path (round-robin across docs would
+  thrash the old single-doc cache); `vis_doc_close()` at job completion so recycled mkstemp paths can
+  never serve a stale document; the render-prefetch marker is keyed (pdf,page) for the same reason.
+  MuPDF store bounded (FZ_STORE_DEFAULT=256MB, was UNLIMITED). CUDA errors stay fail-fast exit(1)
+  (supervisor restarts; ~30s weight reload; readiness = socket bound only after load_weights).
+- **Measured** (RTX 6000 Ada, KV=fp8): 14pg+50pg concurrent docs 8.7s/12.1s (64 pages co-batched,
+  99% util); 1-page doc arriving mid-decode joins at the next admission boundary and returns in 3.1s
+  (vs ~12s drain-then-run); idle 1pg 0.9s e2e. Gates: make check PASS, all 3 md5 BIT-EXACT, gundam-50
+  BIT-IDENTICAL, full-SASS diff clean, make servercheck PASS.

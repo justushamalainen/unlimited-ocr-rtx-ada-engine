@@ -6,12 +6,16 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <deque>
+#include <memory>
+#include <unordered_map>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cublas_v2.h>
 #include "st_loader.h"
+#include "server.h"
 
 #define CK(x) do{cudaError_t _cke_=(x);if(_cke_){fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(_cke_));exit(1);} }while(0)
 #define CB(x) do{cublasStatus_t _cbs_=(x);if(_cbs_){fprintf(stderr,"cuBLAS %s:%d %d\n",__FILE__,__LINE__,(int)_cbs_);exit(1);} }while(0)
@@ -433,8 +437,10 @@ static void prefill(const int* dids,int S,float* dlogits_last,bool check,std::ve
 }
 
 // ===== integrated vision + tokenizer (no python) =====
-extern void vis_render_cpu(const char* pdf,int page);  // split render/GPU for interleaving
+extern bool vis_render_cpu(const char* pdf,int page);  // split render/GPU for interleaving; false = render failed
 extern void vis_upload(); extern void vis_gpu_launch(); extern void vis_gpu_sync(); extern bf16* vis_result();
+extern int vis_page_count(const char* pdf);            // -1 = unreadable
+extern void vis_doc_close(const char* pdf);            // drop doc-cache entry (recycled server temp paths)
 // byte-level BPE decoder (build asset vocab.bin: id -> byte-level utf8 string)
 static std::vector<std::string> g_vocab; static std::map<uint32_t,unsigned char> g_bdec;
 static void load_vocab(const char* path){
@@ -820,14 +826,24 @@ __global__ void k_setdone_b(int* done,const int* tok,const int* act){ int s=bloc
 __global__ void k_incstep_b(int* steps,const int* act){ steps[act[blockIdx.x]]++; }   // per-slot decode position (windowed admission)
 // Page-parallel batched decode with WINDOWED admission: at most W page-streams resident (slots); pages
 // beyond W are encoded+prefilled lazily into slots freed by finished streams -> unlimited page count at
-// flat VRAM (= W*(PF+WIN) KV entries/layer). encpg(page,dst) writes page's vpp visual embeds on demand;
-// without it (or N<=W) all pages are admitted upfront = the classic full-batch behavior (md5 gates run there).
+// flat VRAM (= W*(PF+WIN) KV entries/layer). The page SOURCE feeds admission: FixedSrc = N pages of one
+// doc (CLI/gundam — byte-identical to the pre-server engine; md5 gates run there), QueueSrc = the server's
+// multi-document queue (documents are just a grouping of pages; their pages co-batch in the same window).
 // Invariants: a stream's positions are 0..PF-1 (its own ref) + PF+step — a pure function of its page, never
 // of admission time; slot recycling frees whole streams (no renumbering); WIN=128 untouched.
-static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& po,int vpp=273,void(*encpg)(int,bf16*)=nullptr){
+// Source hooks run on the engine thread ONLY, at admission/16-step sync boundaries, never inside graph capture.
+struct PageSrc{
+    virtual int  next()=0;                                    // next page id to admit now; -1 = none available now
+    virtual const bf16* embeds(int id,bf16* scr,int* pidx)=0; // visual embeds (encode into scr, or upfront buffer + *pidx); nullptr = page unrenderable -> skipped, no slot consumed
+    virtual std::vector<int>& out(int id)=0;                  // per-page token sink
+    virtual void done(int id){}                               // page complete (EOS-at-prefill or retire)
+    virtual bool wait(){return false;}                        // NA==0 & none available: block for more work? false = drain + return
+    virtual bool lazy(){return true;}                         // encode-on-admission (vs upfront dembeds)
+    virtual bool verbose(){return true;}                      // CLI stat prints (TTFT/prefill/decode/windowed)
+    virtual ~PageSrc(){}
+};
+static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
     const int PF=1+vpp+4, MS=PF+WIN;                     // ref = 1 bos + vpp visual + 4 prompt (273=Base, larger=Gundam)
-    static int wcap=[](){const char* s=getenv("WINDOW");return s?atoi(s):128;}();  // resident-stream cap (capacity knob; tok/s scales with batch -> keep high, memory flattens past it)
-    const int W=encpg?std::min(N,std::max(1,wcap)):N;    // no callback -> caller built all embeds upfront -> all resident
     alloc(std::max(PF,W));
     for(int l=0;l<NL;l++){ CK(cudaMalloc(&kcb[l],(size_t)W*MS*H*sizeof(kvt))); CK(cudaMalloc(&vcb[l],(size_t)W*MS*H*sizeof(kvt))); }
     CK(cudaMalloc(&atb_pm,(size_t)W*NH*NSPLITB*4)); CK(cudaMalloc(&atb_pl,(size_t)W*NH*NSPLITB*4)); CK(cudaMalloc(&atb_pacc,(size_t)W*NH*NSPLITB*HD*4));
@@ -839,36 +855,41 @@ static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& 
     CK(cudaMalloc(&d_steps,(size_t)W*4)); CK(cudaMalloc(&outbuf,(size_t)W*MAXSTEP*4)); CK(cudaMalloc(&d_done,(size_t)W*4)); CK(cudaMalloc(&d_act,(size_t)W*4));
     CK(cudaMemset(outbuf,0,(size_t)W*MAXSTEP*4));                    // slots are re-read up to each stream's own step only; memset keeps initcheck clean
     CK(cudaMemset(d_steps,0,(size_t)W*4)); CK(cudaMemset(d_done,0,(size_t)W*4));
-    po.assign(N,{});
     std::vector<int> active,curtok,hsteps(W,0),hdone(W,0),slot2page(W,0),freesl;
     for(int s=W-1;s>=0;s--) freesl.push_back(s);
-    int nextpg=0; bool ttft=false; float admms=0; long nadm=0;       // cumulative admission (encode+prefill) time
+    bool ttft=false; float admms=0; long nadm=0; long total=0;       // cumulative admission (encode+prefill) time; total emitted tokens
+    bool vb=src.verbose();
     bf16 *pe,*vis1=nullptr; float* dlog; CK(cudaMalloc(&pe,(size_t)PF*H*2)); CK(cudaMalloc(&dlog,(size_t)V*4));
-    if(encpg) CK(cudaMalloc(&vis1,(size_t)(1+(size_t)vpp)*H*2));
+    if(src.lazy()) CK(cudaMalloc(&vis1,(size_t)(1+(size_t)vpp)*H*2));
     cudaEvent_t pa,pb,aa,ab; cudaEventCreate(&pa);cudaEventCreate(&pb);cudaEventCreate(&aa);cudaEventCreate(&ab);
     CK(cudaStreamSynchronize(GS)); cudaEventRecord(pa,GS);
     auto admit=[&](){                                                // fill free slots with the next pages: encode -> prefill -> seed slot KV
-        if((int)active.size()>=W || nextpg>=N) return;
+        if((int)active.size()>=W) return;
+        int pid=src.next(); if(pid<0) return;
         cudaEventRecord(aa,GS);
-        while((int)active.size()<W && nextpg<N){
+        for(;;){
             int slot=freesl.back();
-            const bf16* src=dembeds; int pidx=nextpg;
-            if(encpg){ encpg(nextpg,vis1+H); src=vis1; pidx=0; }     // slot-local embeds: callback page lives at index 0
-            k_pageembeds<<<dim3(PF,(H+255)/256),256,0,GS>>>(pe,EMB,src,pidx,0,37460,4366,76466,16,vpp);
-            prefill(nullptr,PF,dlog,false,nullptr,pe);
-            for(int l=0;l<NL;l++){ CK(cudaMemcpyAsync(kcb[l]+(size_t)slot*MS*H,kcache[l],(size_t)PF*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS));
-                                   CK(cudaMemcpyAsync(vcb[l]+(size_t)slot*MS*H,vcache[l],(size_t)PF*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS)); }
-            std::vector<float> ll(V); CK(cudaMemcpy(ll.data(),dlog,(size_t)V*4,cudaMemcpyDeviceToHost));
-            int t=0; for(int e=1;e<V;e++) if(ll[e]>ll[t])t=e; po[nextpg].push_back(t);
-            if(!ttft){ ttft=true; cudaEventRecord(pb,GS); CK(cudaEventSynchronize(pb)); float ms=0; cudaEventElapsedTime(&ms,pa,pb);
-                       printf("TTFT (page 0 %sprefill): %.0f ms\n",encpg?"encode+":"",ms); }
-            if(t!=1){ freesl.pop_back(); slot2page[slot]=nextpg; hsteps[slot]=0; hdone[slot]=0; active.push_back(slot); curtok.push_back(t); }
-            nextpg++; nadm++;
+            int pidx=0; const bf16* semb=src.embeds(pid,vis1,&pidx); // slot-local embeds: encoded page lives at index 0
+            if(semb){
+                k_pageembeds<<<dim3(PF,(H+255)/256),256,0,GS>>>(pe,EMB,semb,pidx,0,37460,4366,76466,16,vpp);
+                prefill(nullptr,PF,dlog,false,nullptr,pe);
+                for(int l=0;l<NL;l++){ CK(cudaMemcpyAsync(kcb[l]+(size_t)slot*MS*H,kcache[l],(size_t)PF*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS));
+                                       CK(cudaMemcpyAsync(vcb[l]+(size_t)slot*MS*H,vcache[l],(size_t)PF*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS)); }
+                std::vector<float> ll(V); CK(cudaMemcpy(ll.data(),dlog,(size_t)V*4,cudaMemcpyDeviceToHost));
+                int t=0; for(int e=1;e<V;e++) if(ll[e]>ll[t])t=e; src.out(pid).push_back(t); total++;
+                if(!ttft){ ttft=true; cudaEventRecord(pb,GS); CK(cudaEventSynchronize(pb)); float ms=0; cudaEventElapsedTime(&ms,pa,pb);
+                           if(vb)printf("TTFT (page 0 %sprefill): %.0f ms\n",src.lazy()?"encode+":"",ms); }
+                if(t!=1){ freesl.pop_back(); slot2page[slot]=pid; hsteps[slot]=0; hdone[slot]=0; active.push_back(slot); curtok.push_back(t); }
+                else src.done(pid);                                  // EOS at prefill: page complete without ever holding a slot
+            } else src.done(pid);                                    // unrenderable page: skipped, completes empty
+            nadm++;
+            if((int)active.size()>=W) break;
+            if((pid=src.next())<0) break;
         }
         cudaEventRecord(ab,GS); CK(cudaEventSynchronize(ab)); float ms=0; cudaEventElapsedTime(&ms,aa,ab); admms+=ms;
     };
     admit();                                             // initial fill: first W pages (windowed) or all (classic)
-    printf("page-parallel prefill: %ld/%d pages in %.0f ms%s\n",nadm,N,admms,W<N?" (windowed)":"");
+    if(vb)printf("page-parallel prefill: %ld/%d pages in %.0f ms%s\n",nadm,Ntotal,admms,W<Ntotal?" (windowed)":"");
     int NA=(int)active.size();
     CK(cudaMemcpy(d_act,active.data(),(size_t)NA*4,cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_tokb,curtok.data(),(size_t)NA*4,cudaMemcpyHostToDevice));
@@ -900,8 +921,8 @@ static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& 
             k_rescore_b<<<(int)(((long)na*NBAM*LMTOPK+7)/8),256,0,GS>>>(nbuf,LMH,dlogb,lmh_cand,lmh_cval,na);
             k_argmax_cand_b<<<na,256,0,GS>>>(lmh_cval,lmh_cand,d_tokb);
             if(lmhdbg>0){ lmhdbg--;                                                      // old path on same nbuf -> token parity
-                static float* dbglog=0; static int* dbgtok=0;
-                if(!dbglog){CK(cudaMalloc(&dbglog,(size_t)na*V*4));CK(cudaMalloc(&dbgtok,na*4));}
+                static float* dbglog=0; static int* dbgtok=0; static int dbgcap=0;
+                if(na>dbgcap){ if(dbglog){cudaFree(dbglog);cudaFree(dbgtok);} CK(cudaMalloc(&dbglog,(size_t)na*V*4));CK(cudaMalloc(&dbgtok,(size_t)na*4)); dbgcap=na; }
                 lin_f32(nbuf,LMH,dbglog,na,H,V);
                 k_ngram_mask<<<na,256,0,GS>>>(dbglog,outbuf,d_steps,MAXSTEP,d_act,ngram);
                 k_argmax_b<<<na,256,0,GS>>>(dbglog,dbgtok,V);
@@ -920,12 +941,19 @@ static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& 
     cudaEvent_t da,db; cudaEventCreate(&da);cudaEventCreate(&db); CK(cudaStreamSynchronize(GS)); cudaEventRecord(da,GS);
     long wsteps=0; const int CK_EVERY=16; long stream_steps=0; bool ng=getenv("DECNOGRAPH");
     auto retire=[&](int slot){                                       // stream done: harvest its outbuf row into its page, free the slot
-        int n=hsteps[slot]; std::vector<int>& out=po[slot2page[slot]];
+        int n=hsteps[slot]; std::vector<int>& out=src.out(slot2page[slot]);
         if(n>0){ std::vector<int> row(n); CK(cudaMemcpy(row.data(),outbuf+(size_t)slot*MAXSTEP,(size_t)n*4,cudaMemcpyDeviceToHost));
-                 for(int t:row){ out.push_back(t); if(t==1)break; } }
+                 for(int t:row){ out.push_back(t); total++; if(t==1)break; } }
+        src.done(slot2page[slot]);
         freesl.push_back(slot);
     };
-    while(NA>0){
+    for(;;){
+        if(NA==0){
+            if(!src.wait()) break;                                   // FixedSrc: drained -> exit (the pre-refactor while(NA>0) exit)
+            admit(); NA=(int)active.size(); if(NA==0) continue;      // server: woke on new work; full device-state re-upload (slots recycled while idle)
+            CK(cudaMemcpy(d_act,active.data(),(size_t)NA*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_tokb,curtok.data(),(size_t)NA*4,cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(d_steps,hsteps.data(),(size_t)W*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_done,hdone.data(),(size_t)W*4,cudaMemcpyHostToDevice));
+        }
         ns=std::min(NSPLITB,std::max((PF+WIN)/48,(284+NH*NA-1)/(NH*NA)));   // more key-splits at small NA to fill the 142 SMs (24 keys/split tried 2026-07: +1% = noise, 0.12% output drift -> reverted)
         if(!ng && !gcache.count(NA)){ cudaGraph_t g; CK(cudaStreamBeginCapture(GS,cudaStreamCaptureModeThreadLocal)); body(NA);
             CK(cudaStreamEndCapture(GS,&g)); cudaGraphExec_t ge; CK(cudaGraphInstantiate(&ge,g,nullptr,nullptr,0)); cudaGraphDestroy(g); gcache[NA]=ge; }
@@ -945,9 +973,10 @@ static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& 
                   CK(cudaMemcpy(d_steps,hsteps.data(),(size_t)W*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_done,hdone.data(),(size_t)W*4,cudaMemcpyHostToDevice)); }
     }
     cudaEventRecord(db,GS); CK(cudaEventSynchronize(db)); float dms=0; cudaEventElapsedTime(&dms,da,db);
-    long total=0; for(int p=0;p<N;p++) total+=(long)po[p].size();
-    printf("page-parallel decode: %ld tok in %.0f ms (%.0f tok/s), %ld steps, %.0f%% batch util\n",total,dms,total*1000.0/dms,wsteps,100.0*total/stream_steps);
-    if(W<N) printf("windowed: %d pages through %d slots, %ld admissions %.0f ms interleaved (KV resident: %d x %d entries/layer)\n",N,W,nadm,admms,W,MS);
+    if(vb){
+        printf("page-parallel decode: %ld tok in %.0f ms (%.0f tok/s), %ld steps, %.0f%% batch util\n",total,dms,total*1000.0/dms,wsteps,100.0*total/stream_steps);
+        if(W<Ntotal) printf("windowed: %d pages through %d slots, %ld admissions %.0f ms interleaved (KV resident: %d x %d entries/layer)\n",Ntotal,W,nadm,admms,W,MS);
+    }
     for(auto&kv:gcache) cudaGraphExecDestroy(kv.second);                 // free per-call GPU scratch (Gundam calls this per page)
     for(int l=0;l<NL;l++){ cudaFree(kcb[l]); cudaFree(vcb[l]); kcb[l]=nullptr; vcb[l]=nullptr; }
     cudaFree(atb_pm); cudaFree(atb_pl); cudaFree(atb_pacc); atb_pm=atb_pl=atb_pacc=nullptr;
@@ -958,15 +987,175 @@ static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& 
     cudaFree(pe); cudaFree(dlog); if(vis1)cudaFree(vis1);
     cudaEventDestroy(pa);cudaEventDestroy(pb);cudaEventDestroy(aa);cudaEventDestroy(ab);cudaEventDestroy(da);cudaEventDestroy(db);
 }
+// CLI/gundam page source: N pages of one document — byte-identical behavior to the pre-refactor engine.
+struct FixedSrc final : PageSrc{
+    int N=0,nextpg=0; const bf16* dembeds=nullptr; std::vector<std::vector<int>>* po=nullptr; void(*encpg)(int,bf16*)=nullptr;
+    int next() override { return nextpg<N?nextpg++:-1; }
+    const bf16* embeds(int id,bf16* scr,int* pidx) override {
+        if(encpg){ encpg(id,scr+H); *pidx=0; return scr; }           // slot-local embeds: callback page lives at index 0
+        *pidx=id; return dembeds;                                    // upfront embeds: page id indexes the caller's buffer
+    }
+    std::vector<int>& out(int id) override { return (*po)[id]; }
+    bool lazy() override { return encpg!=nullptr; }
+};
+static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& po,int vpp=273,void(*encpg)(int,bf16*)=nullptr){
+    static int wcap=[](){const char* s=getenv("WINDOW");return s?atoi(s):128;}();  // resident-stream cap (capacity knob; tok/s scales with batch -> keep high, memory flattens past it)
+    const int W=encpg?std::min(N,std::max(1,wcap)):N;    // no callback -> caller built all embeds upfront -> all resident
+    po.assign(N,{});
+    FixedSrc src; src.N=N; src.dembeds=dembeds; src.po=&po; src.encpg=encpg;
+    generate_pagepar_core(src,vpp,W,N);
+}
 void gundam_vfix();
-static const char* g_pdf=nullptr; static int g_N=0, g_vrend=-1;      // page-encode callback state (windowed admission)
-static void enc_base(int p,bf16* dst){                               // encode page p (base 1024, 273 tok); prefetch-renders p+1 on CPU
-    if(g_vrend!=p){ vis_render_cpu(g_pdf,p); vis_upload(); }
+// Base-mode page encode with next-page prefetch. Marker (g_pf_*) = "this (pdf,page) is already
+// rendered+uploaded to the vision input buffer"; keyed by BOTH pdf and page so multi-document
+// admission (server) can never reuse another document's pixels. Invalidate whenever anything else
+// touches the vision input (gundam runs) or a marked doc goes away.
+static std::string g_pf_pdf; static int g_pf_page=-1;
+static void enc_invalidate(){ g_pf_pdf.clear(); g_pf_page=-1; }
+static bool enc_page(const char* pdf,int p,const char* npdf,int np,bf16* dst){
+    if(!(g_pf_page==p && g_pf_pdf==pdf)){ if(!vis_render_cpu(pdf,p)) return false; vis_upload(); }
     vis_gpu_launch();
-    if(p+1<g_N) vis_render_cpu(g_pdf,p+1);                           // CPU render overlaps the GPU encode
+    bool pre = npdf && vis_render_cpu(npdf,np);                      // CPU render of the NEXT page overlaps the GPU encode
     vis_gpu_sync();
     CK(cudaMemcpy(dst,vis_result(),(size_t)273*H*2,cudaMemcpyDeviceToDevice));
-    if(p+1<g_N){ vis_upload(); g_vrend=p+1; }
+    if(pre){ vis_upload(); g_pf_pdf=npdf; g_pf_page=np; } else enc_invalidate();
+    return true;
+}
+static const char* g_pdf=nullptr; static int g_N=0;                  // CLI page-encode callback state (one doc)
+static void enc_base(int p,bf16* dst){                               // encode page p (base 1024, 273 tok); prefetch-renders p+1 on CPU
+    if(!enc_page(g_pdf,p,(p+1<g_N)?g_pdf:nullptr,p+1,dst)){ fprintf(stderr,"MuPDF render failed: %s page %d\n",g_pdf,p); exit(1); }
+}
+// ===== Gundam OCR of one doc: high-res tiling; BATCHED decode (identical path to Base, vpp=tiles) =====
+// Encodes all pages upfront (uniform tiling -> one batched generate_pagepar; mixed sizes -> sequential
+// fallback). po gets one token stream per page. false = a page failed to render/encode.
+extern int gundam_encode(const char* pdf,int page); extern bf16* gundam_result();
+static bool ocr_gundam(const char* pdf,int N,std::vector<std::vector<int>>& po){
+    po.clear();
+    cudaEvent_t va,vb; cudaEventCreate(&va);cudaEventCreate(&vb); cudaEventRecord(va,0);
+    auto fail=[&](bf16* buf){ if(buf)cudaFree(buf); cudaEventDestroy(va); cudaEventDestroy(vb); return false; };  // server calls this per job: don't leak events
+    int nt0=gundam_encode(pdf,0);                        // assume uniform page size (same tiling -> same vpp)
+    if(nt0<0)return fail(nullptr);
+    bf16* de; CK(cudaMalloc(&de,(size_t)(1+(size_t)N*nt0)*H*2));
+    CK(cudaMemcpy(de+(size_t)1*H,gundam_result(),(size_t)nt0*H*2,cudaMemcpyDeviceToDevice));
+    bool uniform=true; int pg=1;
+    for(;pg<N;pg++){ int nt=gundam_encode(pdf,pg);
+        if(nt<0) return fail(de);
+        if(nt!=nt0){ uniform=false; printf("[gundam] page %d: %d tok != %d -> mixed sizes, sequential fallback\n",pg,nt,nt0); break; }
+        CK(cudaMemcpy(de+(size_t)(1+(size_t)pg*nt0)*H,gundam_result(),(size_t)nt0*H*2,cudaMemcpyDeviceToDevice)); }
+    cudaEventRecord(vb,0); CK(cudaEventSynchronize(vb)); float vms=0; cudaEventElapsedTime(&vms,va,vb);
+    if(uniform){
+        printf("[gundam] %d pages x %d visual tokens (vision %.0f ms) -> BATCHED decode\n",N,nt0,vms);
+        generate_pagepar(N,de,po,nt0);                   // SAME batched decode as Base, just bigger references
+    } else {                                             // mixed page sizes: per-size batching is future work; sequential for now
+        po.clear();
+        for(int p=0;p<N;p++){ int nt=gundam_encode(pdf,p);
+            if(nt<0) return fail(de);
+            bf16* gv=gundam_result();
+            bf16* d1; CK(cudaMalloc(&d1,(size_t)(1+nt)*H*2)); CK(cudaMemcpy(d1+(size_t)1*H,gv,(size_t)nt*H*2,cudaMemcpyDeviceToDevice));
+            std::vector<std::vector<int>> p1; generate_pagepar(1,d1,p1,nt);
+            po.push_back(p1[0]); cudaFree(d1); }
+    }
+    cudaFree(de);
+    cudaEventDestroy(va);cudaEventDestroy(vb);
+    return true;
+}
+// ===== server mode: continuous multi-document serving over the SAME decode loop =====
+// Connection threads (server.cpp) enqueue jobs; the engine thread expands them into (job,page) items
+// and feeds the windowed admission — pages of DIFFERENT documents co-batch in one decode window
+// ("documents are just a grouping of pages"). Round-robin one page per job per free slot, so a 1-page
+// doc admits at the next 16-step boundary even behind a 500-pager. A job on an idle server reproduces
+// the CLI byte-for-byte (same NA trajectory); under concurrent load, co-batching can flip argmax
+// near-ties (same numeric class as windowed NA variation — see DESIGN.md "Serving").
+// Gundam jobs run as exclusive interludes (heterogeneous vpp can't share slots): when one reaches the
+// queue head, next() stops yielding, residents drain, the core returns, ocr_gundam runs, loop re-enters.
+std::string ocr_decode_tokens(const std::vector<int>& toks){
+    std::vector<int> keep; keep.reserve(toks.size());
+    for(int t:toks) if(t!=1) keep.push_back(t);
+    return bpe_decode(keep);
+}
+struct QueueSrc final : PageSrc{
+    struct Item{ std::shared_ptr<OcrJob> job; int page; std::vector<int> toks; };
+    std::unordered_map<int,Item> items; int nid=0;         // live (admittable/in-flight) items only
+    std::deque<std::deque<int>> rr;                        // per-job pending page ids, round-robin
+    void expand(std::shared_ptr<OcrJob> j){                // job -> items (page count read here, engine thread)
+        int n=vis_page_count(j->path.c_str());
+        if(n<=0){ j->status=422; j->err=n<0?"cannot open document":"empty document";
+                  vis_doc_close(j->path.c_str()); srv_complete(std::move(j)); return; }   // a 0-page doc still got cached: drop it (pins the unlinked spool otherwise)
+        if(j->npages>0 && j->npages<n) n=j->npages;
+        j->pages=n; j->pending=n; j->page_toks.assign(n,{});
+        std::deque<int> pend;
+        for(int p=0;p<n;p++){ items[nid]=Item{j,p,{}}; pend.push_back(nid); nid++; }
+        rr.push_back(std::move(pend));
+    }
+    void pump(){ std::shared_ptr<OcrJob> j; while((j=srv_take_base())) expand(std::move(j)); }
+    int next() override {
+        pump();                                            // arrivals join the rotation before each admission
+        while(!rr.empty()){
+            std::deque<int> q=std::move(rr.front()); rr.pop_front();
+            if(q.empty()) continue;
+            int id=q.front(); q.pop_front();
+            if(!q.empty()) rr.push_back(std::move(q));     // rotate: next admission goes to the next job
+            return id;
+        }
+        return -1;
+    }
+    bool peek(const char** pdf,int* page){                 // next admission target (render prefetch)
+        for(auto& q:rr) if(!q.empty()){ Item& it=items.at(q.front()); if(it.job->status!=200)return false;
+                                        *pdf=it.job->path.c_str(); *page=it.page; return true; }
+        return false;
+    }
+    const bf16* embeds(int id,bf16* scr,int* pidx) override {
+        Item& it=items.at(id);
+        if(it.job->status!=200) return nullptr;            // job already failed: skip its remaining pages fast
+        const char* npdf=nullptr; int np=0; peek(&npdf,&np);
+        if(!enc_page(it.job->path.c_str(),it.page,npdf,np,scr+H)){ it.job->status=422; it.job->err="page render failed"; return nullptr; }
+        *pidx=0; return scr;
+    }
+    std::vector<int>& out(int id) override { return items.at(id).toks; }
+    void done(int id) override {
+        auto node=items.extract(id); Item& it=node.mapped(); std::shared_ptr<OcrJob> j=it.job;
+        if(!it.toks.empty()&&it.toks.back()!=1) j->truncated++;   // hit MAXSTEP without EOS
+        j->page_toks[it.page]=std::move(it.toks);
+        if(--j->pending==0){
+            long tk=0; for(auto&p:j->page_toks) for(int t:p) if(t!=1)tk++;
+            j->tokens=tk;
+            vis_doc_close(j->path.c_str());                // spool paths get recycled: never serve a stale doc
+            if(g_pf_pdf==j->path) enc_invalidate();
+            srv_complete(std::move(j));
+        }
+    }
+    bool wait() override { return srv_wait_work(); }       // false = gundam job at head -> drain + return to engine_serve
+    bool verbose() override { return false; }
+};
+static void run_gundam_job(std::shared_ptr<OcrJob> j){
+    static int gcap=[](){const char* s=getenv("GUNDAM_PAGE_CAP");return s?atoi(s):64;}();  // VRAM guard: gundam decodes all-resident (W=N)
+    enc_invalidate();                                      // gundam encode clobbers the base vision input buffer
+    int n=vis_page_count(j->path.c_str());
+    if(n<=0){ j->status=422; j->err=n<0?"cannot open document":"empty document"; }
+    else{
+        if(j->npages>0 && j->npages<n) n=j->npages;
+        if(n>gcap){ j->status=413; j->err="gundam page cap exceeded (GUNDAM_PAGE_CAP="+std::to_string(gcap)+")"; }
+        else{
+            j->pages=n;
+            std::vector<std::vector<int>> po;
+            if(!ocr_gundam(j->path.c_str(),n,po)){ j->status=422; j->err="page render/encode failed"; }
+            else{
+                long tk=0; for(auto&p:po){ if(!p.empty()&&p.back()!=1)j->truncated++; for(int t:p) if(t!=1)tk++; }
+                j->tokens=tk; j->page_toks=std::move(po);
+            }
+        }
+    }
+    enc_invalidate();
+    vis_doc_close(j->path.c_str());
+    srv_complete(std::move(j));
+}
+static void engine_serve(){                                // never returns (fail-fast: CUDA errors exit(1), supervisor restarts)
+    static int wcap=[](){const char* s=getenv("WINDOW");return s?atoi(s):128;}();
+    for(;;){
+        { QueueSrc src; generate_pagepar_core(src,273,std::max(1,wcap),-1); }   // returns only when a gundam job heads the queue
+        std::shared_ptr<OcrJob> j=srv_take_gundam();
+        if(j) run_gundam_job(std::move(j));
+    }
 }
 int main(int argc,char**argv){
     if(getenv("GUNDAM_VFIX")){ gundam_vfix(); return 0; }
@@ -976,38 +1165,28 @@ int main(int argc,char**argv){
     printf("KV cache backend: %s\n", KV_NAME);
     printf("loading weights to GPU...\n"); load_weights(); CK(cudaDeviceSynchronize());
 
-    // ===== OCR (single host thread): ocr_bin [pdf] [npages] =====
+    if(argc>1 && !strcmp(argv[1],"serve")){                   // ===== server: continuous multi-document OCR =====
+        int port=argc>2?atoi(argv[2]):8000;
+        load_vocab("/home/janitor/unlimited-ocr/engine/vocab.bin");
+        extern void init_vision(); init_vision();             // front-load vision weights: readiness = socket bound
+        int bound=server_start(port);
+        printf("[serve] ready on port %d (POST /ocr[?pages=N][&gundam=1], GET /healthz)\n",bound); fflush(stdout);
+        engine_serve();
+        return 0;
+    }
+    // ===== OCR (single host thread): ocr_bin [pdf] [npages] | ocr_bin serve [port] =====
     // Defaults: bundled paper, 1 page. Decode always runs to EOS (per-page, page-parallel). N pages parsed together.
     const char* pdf = argc>1 ? argv[1] : "/home/janitor/unlimited-ocr/Unlimited-OCR.pdf";
     int N      = argc>2 ? atoi(argv[2]) : 1;
-    if(getenv("GUNDAM")){                                    // ===== Gundam: high-res tiling; BATCHED decode (identical path to Base, vpp=tiles) =====
-        extern int gundam_encode(const char* pdf,int page); extern bf16* gundam_result();
+    if(getenv("GUNDAM")){
         load_vocab("/home/janitor/unlimited-ocr/engine/vocab.bin");
-        std::vector<int> allkeep;
-        cudaEvent_t va,vb; cudaEventCreate(&va);cudaEventCreate(&vb); cudaEventRecord(va,0);
-        int nt0=gundam_encode(pdf,0);                        // assume uniform page size (same tiling -> same vpp)
-        bf16* de; CK(cudaMalloc(&de,(size_t)(1+(size_t)N*nt0)*H*2));
-        CK(cudaMemcpy(de+(size_t)1*H,gundam_result(),(size_t)nt0*H*2,cudaMemcpyDeviceToDevice));
-        bool uniform=true; int pg=1;
-        for(;pg<N;pg++){ int nt=gundam_encode(pdf,pg);
-            if(nt!=nt0){ uniform=false; printf("[gundam] page %d: %d tok != %d -> mixed sizes, sequential fallback\n",pg,nt,nt0); break; }
-            CK(cudaMemcpy(de+(size_t)(1+(size_t)pg*nt0)*H,gundam_result(),(size_t)nt0*H*2,cudaMemcpyDeviceToDevice)); }
-        cudaEventRecord(vb,0); CK(cudaEventSynchronize(vb)); float vms=0; cudaEventElapsedTime(&vms,va,vb);
-        if(uniform){
-            printf("[gundam] %d pages x %d visual tokens (vision %.0f ms) -> BATCHED decode\n",N,nt0,vms);
-            std::vector<std::vector<int>> po; generate_pagepar(N,de,po,nt0);          // SAME batched decode as Base, just bigger references
-            for(auto&pgo:po) for(int t:pgo) if(t!=1) allkeep.push_back(t);
-        } else {                                             // mixed page sizes: per-size batching is future work; sequential for now
-            for(int p=0;p<N;p++){ int nt=gundam_encode(pdf,p); bf16* gv=gundam_result();
-                bf16* d1; CK(cudaMalloc(&d1,(size_t)(1+nt)*H*2)); CK(cudaMemcpy(d1+(size_t)1*H,gv,(size_t)nt*H*2,cudaMemcpyDeviceToDevice));
-                std::vector<std::vector<int>> po; generate_pagepar(1,d1,po,nt);
-                for(int t:po[0]) if(t!=1) allkeep.push_back(t); cudaFree(d1); }
-        }
-        cudaFree(de);
+        std::vector<std::vector<int>> po;
+        if(!ocr_gundam(pdf,N,po)){ fprintf(stderr,"gundam encode failed: %s\n",pdf); return 1; }
+        std::vector<int> allkeep; for(auto&pgo:po) for(int t:pgo) if(t!=1) allkeep.push_back(t);
         printf("\n===== OCR (GUNDAM, %d page(s), %d tokens) =====\n%s\n",N,(int)allkeep.size(),bpe_decode(allkeep).c_str());
         return 0;
     }
-    g_pdf=pdf; g_N=N; g_vrend=-1;                             // vision is encoded lazily per admission (enc_base), overlapped CPU render
+    g_pdf=pdf; g_N=N; enc_invalidate();                       // vision is encoded lazily per admission (enc_base), overlapped CPU render
     std::vector<std::vector<int>> po; generate_pagepar(N,nullptr,po,273,enc_base);   // the only decode path: page-parallel, windowed admission
     load_vocab("/home/janitor/unlimited-ocr/engine/vocab.bin");
     std::vector<int> keep; for(auto&pg:po) for(int t:pg) if(t!=1) keep.push_back(t);

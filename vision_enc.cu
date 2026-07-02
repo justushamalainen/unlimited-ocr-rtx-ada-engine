@@ -34,17 +34,50 @@ __global__ void k_resize_norm(const unsigned char* src,int h,int w,int nw,int nh
         float v=p00*(1-dx)*(1-dy)+p01*dx*(1-dy)+p10*(1-dx)*dy+p11*dx*dy; out[(size_t)c*IMG*IMG+oy*IMG+ox]=v/127.5f-1.f;}
 }
 static unsigned char* g_dsrc=nullptr; static size_t g_dsrcn=0;
-static void render_preprocess(const char* pdf,int page,float dpi){  // -> g_dimg
-    fz_context* ctx=fz_new_context(NULL,NULL,FZ_STORE_UNLIMITED); fz_register_document_handlers(ctx);
-    fz_set_aa_level(ctx,2);  // lower anti-aliasing: faster render, no OCR-quality loss (model downsamples to 1024)
-    fz_document* doc=fz_open_document(ctx,pdf); fz_matrix mat=fz_scale(dpi/72.f,dpi/72.f);
-    fz_pixmap* pix=fz_new_pixmap_from_page_number(ctx,doc,page,mat,fz_device_rgb(ctx),0);
+// ---- MuPDF layer (engine thread ONLY: ctx has NULL locks) ----
+// LRU doc cache keyed by path: keeps the open-once-per-doc render cost when the server round-robins
+// pages across documents. fz_try turns corrupt-PDF throws (previously: process abort, no fz_try
+// anywhere) into false/-1 so a bad upload fails its job, not the process.
+static fz_context* g_ctx=nullptr;
+#define NDOC 8
+static struct DocEnt{ std::string path; fz_document* doc; long use; } g_docs[NDOC]; static long g_docuse=0;
+static fz_context* fzctx(){
+    if(!g_ctx){ g_ctx=fz_new_context(NULL,NULL,FZ_STORE_DEFAULT); fz_register_document_handlers(g_ctx);
+        fz_set_aa_level(g_ctx,2); }  // lower anti-aliasing: faster render, no OCR-quality loss (model downsamples to 1024); bounded store caps host RSS on huge docs
+    return g_ctx;
+}
+static fz_document* fzdoc(const char* pdf){          // cached open; nullptr = unreadable
+    fz_context* ctx=fzctx(); int lru=0;
+    for(int i=0;i<NDOC;i++){ if(g_docs[i].doc && g_docs[i].path==pdf){ g_docs[i].use=++g_docuse; return g_docs[i].doc; }
+                             if(g_docs[i].use<g_docs[lru].use) lru=i; }
+    if(g_docs[lru].doc){ fz_drop_document(ctx,g_docs[lru].doc); g_docs[lru].doc=nullptr; g_docs[lru].path.clear(); }  // null-then-open: an open throw must not leave a dangling entry
+    fz_document* d=nullptr;
+    fz_try(ctx){ d=fz_open_document(ctx,pdf); } fz_catch(ctx){ d=nullptr; }
+    if(d){ g_docs[lru].path=pdf; g_docs[lru].doc=d; g_docs[lru].use=++g_docuse; }
+    return d;
+}
+void vis_doc_close(const char* pdf){                 // server: recycled temp paths must never hit a stale cache entry
+    if(!g_ctx)return;
+    for(int i=0;i<NDOC;i++) if(g_docs[i].doc && g_docs[i].path==pdf){ fz_drop_document(g_ctx,g_docs[i].doc); g_docs[i].doc=nullptr; g_docs[i].path.clear(); g_docs[i].use=0; }
+}
+int vis_page_count(const char* pdf){                 // -1 = unreadable
+    fz_context* ctx=fzctx(); fz_document* d=fzdoc(pdf); if(!d)return -1;
+    int n=-1;
+    fz_try(ctx){ n=fz_count_pages(ctx,d); } fz_catch(ctx){ n=-1; }
+    return n;
+}
+static bool render_preprocess(const char* pdf,int page,float dpi){  // -> g_dimg; false = render failed
+    fz_context* ctx=fzctx(); fz_document* doc=fzdoc(pdf); if(!doc)return false;
+    fz_matrix mat=fz_scale(dpi/72.f,dpi/72.f);
+    fz_pixmap* pix=nullptr; fz_var(pix);
+    fz_try(ctx){ pix=fz_new_pixmap_from_page_number(ctx,doc,page,mat,fz_device_rgb(ctx),0); } fz_catch(ctx){ return false; }
     int w=fz_pixmap_width(ctx,pix),h=fz_pixmap_height(ctx,pix); unsigned char* sm=fz_pixmap_samples(ctx,pix);
     if((size_t)w*h*3>g_dsrcn){ if(g_dsrc)cudaFree(g_dsrc); CK(cudaMalloc(&g_dsrc,(size_t)w*h*3)); g_dsrcn=(size_t)w*h*3; }
     CK(cudaMemcpy(g_dsrc,sm,(size_t)w*h*3,cudaMemcpyHostToDevice));
     float sc=fminf((float)IMG/w,(float)IMG/h); int nw=(int)lroundf(w*sc),nh=(int)lroundf(h*sc),offx=(IMG-nw)/2,offy=(IMG-nh)/2;
     dim3 b(16,16),g((IMG+15)/16,(IMG+15)/16); k_resize_norm<<<g,b>>>(g_dsrc,h,w,nw,nh,offx,offy,g_dimg);
-    fz_drop_pixmap(ctx,pix); fz_drop_document(ctx,doc); fz_drop_context(ctx);
+    fz_drop_pixmap(ctx,pix);
+    return true;
 }
 
 // ---- weight loading ----
@@ -476,8 +509,8 @@ static void ensure_graph(){
     vision_gpu();
     CK(cudaStreamEndCapture(VS,&g)); CK(cudaGraphInstantiate(&g_vgraph,g,nullptr,nullptr,0));
 }
-bf16* vision_encode(const char* pdf,int page){   // single-page convenience entry (PDF page -> 273 visual tokens)
-    init_vision(); render_preprocess(pdf,page,120.f); ensure_graph();
+bf16* vision_encode(const char* pdf,int page){   // single-page convenience entry (PDF page -> 273 visual tokens); nullptr = render failed
+    init_vision(); if(!render_preprocess(pdf,page,120.f))return nullptr; ensure_graph();
     CK(cudaGraphLaunch(g_vgraph,VS)); CK(cudaStreamSynchronize(VS));
     return g_vis;
 }
@@ -520,15 +553,15 @@ void gundam_vfix(){
 }
 // ---- split render(CPU) / GPU for multi-page render/compute interleaving ----
 static std::vector<unsigned char> g_hostrgb; static int g_hw[2];
-static fz_context* g_ctx=nullptr; static fz_document* g_doc=nullptr; static std::string g_docpath;
-void vis_render_cpu(const char* pdf,int page){   // CPU only: MuPDF rasterize -> host RGB (overlaps GPU). Single-threaded ctx.
-    if(!g_ctx){ g_ctx=fz_new_context(NULL,NULL,FZ_STORE_UNLIMITED); fz_register_document_handlers(g_ctx); fz_set_aa_level(g_ctx,2); }
-    if(g_docpath!=pdf){ if(g_doc)fz_drop_document(g_ctx,g_doc); g_doc=fz_open_document(g_ctx,pdf); g_docpath=pdf; }  // open once, reuse
+bool vis_render_cpu(const char* pdf,int page){   // CPU only: MuPDF rasterize -> host RGB (overlaps GPU). Single-threaded ctx. false = render failed.
+    fz_context* ctx=fzctx(); fz_document* doc=fzdoc(pdf); if(!doc)return false;
     fz_matrix mat=fz_scale(120.f/72.f,120.f/72.f);
-    fz_pixmap* pix=fz_new_pixmap_from_page_number(g_ctx,g_doc,page,mat,fz_device_rgb(g_ctx),0);
-    int w=fz_pixmap_width(g_ctx,pix),h=fz_pixmap_height(g_ctx,pix); unsigned char* sm=fz_pixmap_samples(g_ctx,pix);
+    fz_pixmap* pix=nullptr; fz_var(pix);
+    fz_try(ctx){ pix=fz_new_pixmap_from_page_number(ctx,doc,page,mat,fz_device_rgb(ctx),0); } fz_catch(ctx){ return false; }
+    int w=fz_pixmap_width(ctx,pix),h=fz_pixmap_height(ctx,pix); unsigned char* sm=fz_pixmap_samples(ctx,pix);
     g_hostrgb.assign(sm,sm+(size_t)w*h*3); g_hw[0]=w; g_hw[1]=h;
-    fz_drop_pixmap(g_ctx,pix);
+    fz_drop_pixmap(ctx,pix);
+    return true;
 }
 void vis_upload(){   // host RGB -> g_dimg (GPU, small)
     init_vision(); int w=g_hw[0],h=g_hw[1];
@@ -562,22 +595,25 @@ __global__ void k_gundam_tiles(const unsigned char* src,int sw,int w,float* out)
     int row=p/w, col=p%w; int sy=row*640+y, sx=col*640+x;
     out[((size_t)(p*3+c)*640+y)*640+x]=src[((size_t)sy*sw+sx)*3+c]/127.5f-1.f;
 }
-static void gundam_render(const char* pdf,int page){
-    if(!g_ctx){ g_ctx=fz_new_context(NULL,NULL,FZ_STORE_UNLIMITED); fz_register_document_handlers(g_ctx); fz_set_aa_level(g_ctx,2); }
-    if(g_docpath!=pdf){ if(g_doc)fz_drop_document(g_ctx,g_doc); g_doc=fz_open_document(g_ctx,pdf); g_docpath=pdf; }
-    fz_page* pg=fz_load_page(g_ctx,g_doc,page); fz_rect r=fz_bound_page(g_ctx,pg); float pw=r.x1-r.x0, ph=r.y1-r.y0;
-    gundam_ratio(pw,ph,&g_gw,&g_gh); g_gP=g_gw*g_gh; int SW=640*g_gw, SH=640*g_gh;
-    fz_matrix mat=fz_scale((float)SW/pw,(float)SH/ph);                                // anisotropic -> exact (SW,SH)
-    fz_pixmap* pix=fz_new_pixmap_from_page(g_ctx,pg,mat,fz_device_rgb(g_ctx),0);
-    int w=fz_pixmap_width(g_ctx,pix),h=fz_pixmap_height(g_ctx,pix); unsigned char* sm=fz_pixmap_samples(g_ctx,pix);
+static bool gundam_render(const char* pdf,int page){
+    fz_context* ctx=fzctx(); fz_document* doc=fzdoc(pdf); if(!doc)return false;
+    fz_page* pg=nullptr; fz_pixmap* pix=nullptr; fz_var(pg); fz_var(pix);
+    fz_try(ctx){
+        pg=fz_load_page(ctx,doc,page); fz_rect r=fz_bound_page(ctx,pg); float pw=r.x1-r.x0, ph=r.y1-r.y0;
+        gundam_ratio(pw,ph,&g_gw,&g_gh); g_gP=g_gw*g_gh; int SW=640*g_gw, SH=640*g_gh;
+        fz_matrix mat=fz_scale((float)SW/pw,(float)SH/ph);                            // anisotropic -> exact (SW,SH)
+        pix=fz_new_pixmap_from_page(ctx,pg,mat,fz_device_rgb(ctx),0);
+    } fz_catch(ctx){ if(pg)fz_drop_page(ctx,pg); return false; }
+    int w=fz_pixmap_width(ctx,pix),h=fz_pixmap_height(ctx,pix); unsigned char* sm=fz_pixmap_samples(ctx,pix);
     if((size_t)w*h*3>g_dtilesn){ if(g_dtiles)cudaFree(g_dtiles); CK(cudaMalloc(&g_dtiles,(size_t)w*h*3)); g_dtilesn=(size_t)w*h*3; }
     CK(cudaMemcpyAsync(g_dtiles,sm,(size_t)w*h*3,cudaMemcpyHostToDevice,VS));
     if(!g_tilesf) CK(cudaMalloc(&g_tilesf,(size_t)32*3*640*640*4));
     size_t TOT=(size_t)g_gP*3*640*640; k_gundam_tiles<<<(TOT+255)/256,256,0,VS>>>(g_dtiles,w,g_gw,g_tilesf);
-    fz_drop_pixmap(g_ctx,pix); fz_drop_page(g_ctx,pg);
+    fz_drop_pixmap(ctx,pix); fz_drop_page(ctx,pg);                                    // safe: pageable-src cudaMemcpyAsync returns only after staging
+    return true;
 }
-int gundam_encode(const char* pdf,int page){                                          // PDF page -> g_gundam [ntok,1280]
-    init_vision(); render_preprocess(pdf,page,120.f); gundam_render(pdf,page);
+int gundam_encode(const char* pdf,int page){                                          // PDF page -> g_gundam [ntok,1280]; -1 = render failed
+    init_vision(); if(!render_preprocess(pdf,page,120.f))return -1; if(!gundam_render(pdf,page))return -1;
     int nt=gundam_assemble(g_dimg,g_tilesf,g_gw,g_gh,g_gP); CK(cudaStreamSynchronize(VS)); return nt;
 }
 bf16* gundam_result(){ return g_gundam; }
