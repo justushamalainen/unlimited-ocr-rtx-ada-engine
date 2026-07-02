@@ -375,3 +375,141 @@ per token); dequant-once fp8 (low parallelism / predication waste); int4 lm_head
 Lesson: at batch the dense projections are GEMM-shaped and cuBLAS's tiling beats hand fp8 kernels despite
 2x the bytes; realizing fp8 at batch needs cublasLt fp8 TENSOR-CORE GEMM, not warp kernels.
 Final 14-page: decode ~2850 tok/s (2.76x sequential 1033, ~38x HF-eager), e2e ~6.3s vs 16.2s. 95.6% identical.
+
+## vLLM comparison + ncu re-audit (2026-07-01)
+Benchmarked vs vLLM main (0.23.1rc1.dev704+g4787f2dd1, precompiled; PyPI 0.24.0 lacks the
+UnlimitedOCRForCausalLM arch) serving ./model with the official recipe flags (NGramPerReqLogitsProcessor,
+--no-enable-prefix-caching, --mm-processor-cache-gb 0). vLLM's port is faithful (R-SWA via FlexAttention
+mask; single-image=gundam, multi-image=base). Same 14pg paper, 300dpi pages, greedy, ngram 35.
+Setup lives in .venv-vllm (serve needs ninja on PATH); client = vllm_bench.py; outputs_vllm/.
+
+| workload | engine | vLLM | ratio |
+|---|---|---|---|
+| 1pg gundam | 2.2s cold / ~0.9s warm, 935 tok/s dec | 4.0s (TTFT 1.1s, 176 tok/s dec) | ~4.4x warm |
+| 14pg one-shot (base) | 6.4s e2e, 3114 tok/s dec | 105.9s, 144 tok/s dec | 16.5x |
+| 14pg throughput | 6.4s base / 8.0s gundam-batched (2900 tok/s) | 21.8s = 14 conc reqs, 615 tok/s agg | 2.7-3.4x |
+| GPU mem | ~10 GB | 45.4 GB (0.9 prealloc) | |
+
+Output parity: 1pg 99.8% identical (coords stripped); 14pg 86.7% (= pagepar-vs-sequential semantics
++ greedy drift; no repetition either side; vLLM 202 det els vs engine 185). Structural reason vLLM
+loses: sequential bf16 batch-1 decode of a 14k-token doc; its continuous batching (615 tok/s) can't
+express page-parallel decode.
+
+ncu re-audit of the batched Base path (sudo /usr/local/cuda/bin/ncu, DECNOGRAPH=1; decode is 100%
+GPU-busy — zero launch slack; 2.68ms/step @ NA=14: MoE 1.26ms=47%, cuBLAS proj+lmhead 800us, attn 228us):
+- k_moe_gateup_q4_b / k_moe_down_q4_b: SM 79/83%, warps active 93/86%, DRAM 10/9%, ~16 cyc/inst
+  -> compute/ISSUE-bound on dequant+FMA (confirms the register-limited ILP-optimum finding; the
+  bandwidth story is over at batch — bytes are NOT the limiter).
+- lm_head bf16 GEMM (B>=7): 92.6% DRAM reading 331MB/step = at bf16 floor; only fewer bytes helps.
+- projections cutlass 16x16 @ M=14: qkv near BW floor; small ones (o_proj etc) latency-bound (2% occ).
+- k_attn_split_b @ NA=14: 15% occupancy, DRAM 48% (bulk ns=8 never re-tuned).
+
+### Remaining levers, ranked (NOT yet tried; accuracy gates = md5 pair + brochure small-text)
+[2026-07-02 outcomes: (1) DONE +25.5% = TCMOE below. (2) DONE +6.1% token-exact = LMHMMA below.
+(3) TRIED & PARKED as custom mma kernels, -4%, see "FP8MMA" section. (4) TRIED & REVERTED, +1% = noise.]
+1. TENSOR-CORE INT4 MoE (est +20-30% decode): MoE is 47% of step at 10% DRAM. Feed RAW int4 values
+   to WMMA as bf16 (ints -8..7 are bf16-EXACT), fp32 accum per K=128 group, apply fp32 group scale
+   POST-accumulation: same products reassociated (no fp8-style rounding), gather (token,slot) by
+   expert into M=16 tiles (avg 1.3 tok/expert -> ~9x pad waste, but TCs have ~30x headroom over the
+   5.8 TFLOP/s the ALU path achieves). Sidesteps both "no int4 TCs on Ada" (uses bf16 TCs) and the
+   fp8 small-text veto. Verify vs gates before believing any number.
+2. BATCHED EXACT-RESCORE INT4 LM_HEAD for B>=7 (est +6-8%): revive the deleted single-stream
+   two-stage exact argmax (int4 full logits rank -> bf16 rescore top-1024 -> argmax; provably equal
+   if true argmax lands in top-1024 — it always did). Kernels (k_lmhead_q4/k_topk_blocks/k_rescore/
+   k_argmax_cand) are in git history; batch them. 331MB -> ~83MB+rescore per step. The earlier
+   "int4 lm_head loses at batch" dead end was the PLAIN tiled kernel, not the rescore variant.
+3. cublasLt FP8 TENSOR-CORE GEMM for qkvo/shared at B>=5 (est +8-9%): the noted "realizing fp8 at
+   batch needs cublasLt fp8 GEMM" lever. fp8 projections already ship at NA<=3, so precedent exists,
+   but fp8 flipped small-text tokens on lm_head/vision -> ship ONLY if brochure check passes.
+4. Bulk attn split ns 8->16/24 (est +1-3%, cheap): k_attn_split_b occupancy 15% at NA=14.
+Not worth re-trying (re-verified): vision at bf16 roofline (SAM SxV GEMM 88% DRAM), vision/prefill
+pipelining (reverted, ~4%), qkv GEMM (near floor), launch overhead (graphs already remove it).
+
+## Tensor-core int4 kernels: TCMOE + LMHMMA (2026-07-02, levers 1+2 from the ncu re-audit)
+Design chosen by a 3-design/3-judge panel (PTX mma.sync m16n8k16 beat WMMA-API and split-K-by-group variants).
+**TCMOE** (`k_moe_bins`/`k_moe_gateup_mma`/`k_moe_down_mma`/`k_moe_comb_b`; dispatch hardwired at NA>=TCMIN=4 —
+the TCMOE/TCMOE_MASK env gates existed during bring-up and were removed in the 2026-07-02 single-engine
+consolidation after sign-off): replaces the warp-per-(token,slot,row) int4 MoE at NA>=4 (ncu showed it
+ISSUE-bound: SM 79-83%, DRAM 9-10%). A-fragment = 16 weight rows (8 gate + 8 up of the SAME r-range -> silu
+register-local; down: d,d+8), B = 8 tokens, fp32 accumulators; fp32 group scale applied IN-REGISTER to the
+group partial via the C-fragment row map (r = 8j+lane/4) -- no shared round-trip; weights stream DRAM->reg
+in fragment order (never touch shared) from a load-time relay of the SAME q4 nibbles (biased +8 = raw^8;
+(0x4300|m)-0x4308 = m-8 EXACT in bf16 -> products exact, reassociated only). Deterministic: bins built in
+fixed (t,slot) order (`k_moe_bins`), down combine in fixed slot order. Graph-safe: fixed grids, cnt-guarded
+early exits. TCDBG=n A/B vs old kernels on live activations (measured: mh sub-bf16-ULP, Yf ~1e-5 = pure
+reassociation). racecheck/initcheck/memcheck CLEAN. md5 gates BIT-EXACT (NA=1 keeps old kernels).
+**Perf: 14pg decode 3095 -> 3884 tok/s (+25.5%); N=4 +6.6%, N=7 +13.6%, Gundam-batched 14pg 2807 -> 3536 (+26%).**
+Output drift (fp32 reassociation flipping greedy near-ties): 14pg = 99.96% coords-stripped similarity —
+exactly 3 spots: "Baidu"+"百度" header boxes merged (184 vs 185 els), one TOC dot-leader dropped, one
+table-header cell TED5->TEDS1. Deterministic run-to-run. **Drift SIGNED OFF by user 2026-07-02**, after
+which the env gate was removed — the tensor-core path IS the engine at NA>=4 (rebuild with TCMIN huge to
+reproduce pre-TCMOE output). New 14pg base regression md5 (OCR section): af3a8ae8e348d6b2104b3544363b4f37.
+**LMHMMA** (`k_lmhead_mma`/`k_topk_blocks_b`/`k_rescore_b`/`k_argmax_cand_b`; hardwired at na>4, the LMHMMA
+env gate removed in the same consolidation; LMHDBG=n token-parity A/B vs bf16 cuBLAS full logits remains):
+revives the exact-rescore lm_head (DESIGN 138-146) batched, for na>=5: int4 mma ranking
+(83MB, same tile skeleton, per-(row,group) fp32 scales) -> ngram mask on ranked logits (bans can't become
+candidates; rescore preserves -1e30) -> per-block top-4 = 1024 cands/token -> bf16 rescore (fp32 accum) ->
+argmax. **TOKEN-EXACT vs the 331MB bf16 cuBLAS path: 0 mismatches over the full 14pg run (LMHDBG); during
+bring-up, this path combined with the then-existing TCMOE=0 gate reproduced the pre-change reference
+output BIT-IDENTICALLY — that historical validation is why it ships ungated.**
+**Perf: +6.1% on top of TCMOE -> 4121 tok/s 14pg first measurement, 4148-4175 re-measured on idle GPU
+(+34% total vs 3095). na<=4 path untouched (md5 gates).**
+
+## FP8MMA: fp8-mma projections at NA>3 — measured, PARKED (2026-07-02, lever 3)
+Attempted the "fp8 projections at batch" lever as custom mma kernels instead of cublasLt (deterministic,
+graph-safe, reuses the TCMOE tile skeleton): `k_proj_mma_fp8` (qkv/o/dense-down/shared-down, optional
+fused bias folds `k_combine`) + `k_swiglu_mma_fp8` (gate|up interleaved per m16 tile, register SwiGLU),
+weights from a load-time relay of the SAME e4m3 bytes + per-row scale pairs (`repack_p8`). Env `FP8MMA`
+= bitmask 1 qkv / 2 o / 4 dense / 8 shared (1 -> all), default **0 = OFF**; repacks only allocated when
+enabled (~180MB). `FP8DBG=n` A/Bs vs the per-token fp8 kernels on live activations.
+- v1 (e4m3->bf16 via 256-entry shared LUT): 3225 tok/s 14pg = **-22%**. Bottleneck: ~1.3k random-indexed
+  shared loads/thread (bank-conflict serialized).
+- v2 (sm_89 hw `cvt.rn.f16x2.e4m3x2` + f16 mma, exact for weights AND bf16 activations in f16 range):
+  3995 tok/s = **-4%**; Gundam-50 (NA=50) 3836 vs 4214 = -9%. Numerics: FP8DBG sub-ULP vs per-token fp8
+  on all 5 sites (kernels correct); output vs bf16 path 99.85% sim on the paper PDF but only **92.4% on
+  the small-text brochure** (850 vs 868 det els) — fp8-at-batch measurably hurts dense small text, so it
+  would have needed a hard accuracy fight even at a perf win.
+- Why it loses: nsys shows k_proj_mma_fp8 at 17.2us avg vs 5.6-7.8us for the cuBLAS bf16 GEMMs it
+  replaces. At these sizes cuBLAS is already near the DRAM floor (96MB L2 absorbs re-reads), so fp8's 2x
+  weight-traffic saving only materializes with a cutlass-grade cp.async multi-stage pipeline — not worth
+  the complexity + accuracy sign-off burden for <=+10% ceiling. Grid starvation (20-60 blocks at NA=14)
+  was the v1 co-factor; v2 closed most of it, the pipeline gap is what remains.
+Verdict: engine keeps cuBLAS bf16 at NA>PPSMALL. **Code REMOVED from the tree** in the same-day
+single-engine consolidation (user: "single engine, not multiple gated ones") — it was never committed, so
+THIS SECTION is the record: kernels `k_proj_mma_fp8`/`k_swiglu_mma_fp8` (TCMOE tile skeleton + P8FRAGH =
+hw `cvt.rn.f16x2.e4m3x2` pairs + `b2h2` bf16->f16 staging + f16 mma), `repack_p8` relay (word = bytes
+[rA k, rA k+1, rB k, rB k+1], word1 at k+8, pair=1 interleaves gate|up rows 8j / rows/2+8j, per-row scale
+float2 pairs), dispatch was `else if(fp8mma&bit)` between the small-batch and cuBLAS branches. Rebuild
+from this + the TCMOE kernels in ~200 lines if NA regimes ever change (e.g. batch-windowing at NA>>50).
+
+## Windowed admission: unlimited pages at flat VRAM (2026-07-02, ROADMAP WS1+WS2)
+The spec's lazy page loading + page-level KV eviction collapse, in this engine's page-parallel
+architecture, into ONE mechanism: a rolling window of W resident page-streams (`WINDOW` env, default 128).
+`generate_pagepar(N,dembeds,po,vpp,encpg)` — with an `encpg(page,dst)` callback (base mode: `enc_base`,
+lazy vision with CPU-render lookahead) pages are encoded+prefilled ON ADMISSION into a recycled slot;
+without it (Gundam, gundam-mixed fallback) all pages are resident as before. Mechanics: per-SLOT step
+counters `d_steps[W]` (k_rope_store_b/k_attn_split_b/k_ngram_mask/k_record_b index dstep[slot];
+k_incstep_b increments active slots) so streams admitted at different times coexist in one batched step;
+admission at the 16-step sync boundary tops the window back up (encode -> prefill -> seed slot KV -> join
+d_act); retirement harvests the slot's outbuf row into its page and frees the slot. Invariants held: a
+stream's positions are a pure function of its page (never admission time); slot recycling never renumbers
+anything (prefix region overwritten by the seed copy, ring region only read up to the stream's own step);
+WIN=128 and all weights untouched. BDPREFILL block-diag prefill deleted (windowing removed its upfront-
+embeds input; was a no-speedup experiment, EXPERIMENTS Exp-2).
+**Results (112-page doc = 8x paper, base mode; final numbers on idle GPU):** one continuous session,
+108,752 tok in 6.0 s decode = **18,136 tok/s**; TTFT 353 ms (page-0 encode+prefill vs whole-doc prefill);
+99% batch util maintained by rolling admission; peak process VRAM 11.4 GB (W=16) / 12.1 (W=64) / 12.7
+(W=112) — W-bound, not N-bound. Throughput SCALES with resident batch (per-token step cost 56us at NA=112
+vs 110us at NA=64) -> default WINDOW=128 (memory flattens past it, full speed below it). Output: W=64
+windowed 112pg first block 99.89% identical to the 14pg reference, 185 det els per 14-page block;
+WINDOW=4 stress (14pg through 4 slots) 99.53%. All 3 md5 gates BIT-EXACT and gundam-50 BIT-IDENTICAL to
+the pre-windowing engine (N<=W reproduces classic full-batch behavior exactly), make check PASS.
+**Codegen bit-exactness lesson:** the first windowing build changed gundam-50 output (a coordinate
+near-tie flipped at step ~160, cascading to a 4096-step run-on page and -35%% tok/s on that asset) with
+ZERO logical change — hoisting `int ps=act[s]` above the `dstep` load made ptxas reschedule the FP
+sequence of k_attn_split_b (244 vs 316 FP ops), and sub-ULP rounding differences flip near-ties on
+gundam's 3.1k-key accumulations (base's 406-key chains were unaffected -> base md5s alone did NOT catch
+it). Fix: keep the exact expression shape (`dstep[act[s]]` swapped in-place for `*dstep`, original `ps`
+line untouched) -> FP opcode sequence identical (cuobjdump -sass diff) -> gundam-50 md5 restored.
+When touching bit-verified kernels, diff the SASS FP-opcode sequence, and gate on the LONGEST-chain
+workload, not just the fastest one.

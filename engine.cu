@@ -40,7 +40,6 @@ static const float EPS=1e-6f, ROPE_THETA=10000.f;
 static cublasHandle_t CUB;
 static SafeTensors ST;
 static cudaStream_t GS=0;     // universal stream (captured for the decode graph)
-static int* d_pos=nullptr;    // device-resident decode position
 
 static bf16* up(const std::string& name){
     const Tensor& t=ST.get(name); bf16* d; CK(cudaMalloc(&d,t.nbytes));
@@ -56,10 +55,12 @@ struct Layer{ bf16 *in_norm,*post_norm,*q,*k,*v,*o,*gate,*qkv; // qkv = fused [3
               // fp8 (e4m3) weights + per-row scales for decode
               uint8_t *qkv8,*o8,*shgu8,*shd8,*eg8,*eu8,*ed8,*dgu8,*dd8;
               float *qkv_s,*o_s,*shgu_s,*shd_s,*eg_s,*eu_s,*ed_s,*dgu_s,*dd_s;
+              uint32_t *egu4t,*ed4t; float2 *sgu2,*sd2;   // mma-tiled int4 repack + float2 group scales (tensor-core MoE)
               bool dense; };
 static Layer L[NL];
 static bf16 *EMB,*LMH,*FNORM;
 static uint8_t* LMH4=nullptr; static float* lmh_s4=nullptr;      // int4 group-128 lm_head + group scales
+static uint32_t* LMH4T=nullptr; static float2* LMH_S2=nullptr;   // mma-tiled lm_head relay (LMHMMA path)
 
 // quantize [rows,cols] bf16 -> e4m3 (raw uint8) with per-row scale = maxabs/448
 __global__ void k_quant_rows(const bf16* W,uint8_t* W8,float* scale,int cols){
@@ -90,14 +91,6 @@ __device__ __forceinline__ float dot_fp8_vec(const uint8_t* wrow,const bf16* x,i
     float acc=(a[0]+a[1])+(a[2]+a[3]);
     for(int o=16;o;o>>=1)acc+=__shfl_xor_sync(~0u,acc,o); return acc;
 }
-// lm_head GEMV in fp8: out[v]=scale[v]*dot(x, deq(W8[v])); one warp per vocab row
-__global__ void k_lmhead_fp8(const bf16* x,const uint8_t* W8,const float* scale,float* out,int rows){
-    int gw=blockIdx.x*(blockDim.x/32)+(threadIdx.x>>5), lane=threadIdx.x&31; if(gw>=rows)return;
-    float acc=dot_fp8_vec(W8+(size_t)gw*H,x,H);
-    if(lane==0)out[gw]=acc*scale[gw];
-}
-// generic fp8 GEMV (bf16 out): out[r]=scale[r]*dot(x[cols], deq(W8[r])); warp/row. <<<(rows+7)/8,256>>>
-// fp8 GEMV with float bias add (folds k_combine into shared down): out[r]=bias[r]+scale[r]*dot
 #define QG 128
 __device__ __forceinline__ int I4LO(uint8_t by){ int v=by&0xF; return v>7?v-16:v; }
 __device__ __forceinline__ int I4HI(uint8_t by){ int v=(by>>4)&0xF; return v>7?v-16:v; }
@@ -145,10 +138,58 @@ __global__ void k_moe_down_bf16_S(const bf16* hbuf,const int* idx,const float* w
         ysum+=w[t*TOPK+slot]*acc; }
     if(lane==0)Yf[(size_t)t*H+d]=ysum;
 }
-// q4 (group-128) expert down: warp per (slot,d), atomic-accumulate into Yf (needs Yf pre-zeroed).
 static void quant_q4(bf16* W,int rows,int cols,uint8_t** W4,float** sc){
     CK(cudaMalloc(W4,(size_t)rows*(cols/2))); CK(cudaMalloc(sc,(size_t)rows*(cols/QG)*4));
     k_quant_rows_q4<<<rows,QG,0,GS>>>(W,*W4,*sc,cols);
+}
+// ===== mma-tile repack (TCMOE): same q4 nibbles relaid fragment-ordered, biased +8 (= raw^8, since m=v+8 = n^8).
+// Word (lane,ks) bits: [0:4)=w(rA,k) [4:8)=w(rB,k) [8:12)=w(rA,k+8) [12:16)=w(rB,k+8) [16:20)=w(rA,k+1)
+// [20:24)=w(rB,k+1) [24:28)=w(rA,k+9) [28:32)=w(rB,k+9); k=kb+2*(lane&3), kb=g*QG+ks*16, ks=4p+(wi&3).
+// gateup tile j: rA=gate row 8j+(lane>>2), rB=up row (same r). down tile j: rA=d=16j+(lane>>2), rB=d+8.
+__global__ void k_repack_gu(const uint8_t* G4,const uint8_t* U4,uint32_t* T){        // grid(64,112,10) block 256 (wi = p*128+lane*4+s)
+    int e=blockIdx.x,j=blockIdx.y,g=blockIdx.z,wi=threadIdx.x,lane=(wi>>2)&31;
+    int kb=g*QG+((wi>>7)*4+(wi&3))*16, klo=kb+2*(lane&3); size_t rg=((size_t)e*MOEI+8*j+(lane>>2))*(H/2);
+    uint8_t g0=G4[rg+klo/2],g1=G4[rg+(klo+8)/2],u0=U4[rg+klo/2],u1=U4[rg+(klo+8)/2];
+    T[((((size_t)e*112+j)*10+g)<<8)+wi] = ((g0&0xFu)^8u)|(((u0&0xFu)^8u)<<4)|(((g1&0xFu)^8u)<<8)|(((u1&0xFu)^8u)<<12)
+        |((uint32_t)((g0>>4)^8u)<<16)|((uint32_t)((u0>>4)^8u)<<20)|((uint32_t)((g1>>4)^8u)<<24)|((uint32_t)((u1>>4)^8u)<<28);
+}
+__global__ void k_repack_dn(const uint8_t* D4,uint32_t* T){                          // grid(64,80,7) block 256
+    int e=blockIdx.x,j=blockIdx.y,g=blockIdx.z,wi=threadIdx.x,lane=(wi>>2)&31;
+    int kb=g*QG+((wi>>7)*4+(wi&3))*16, klo=kb+2*(lane&3);
+    size_t rA=((size_t)e*H+16*j+(lane>>2))*(MOEI/2), rB=rA+8*(MOEI/2);
+    uint8_t a0=D4[rA+klo/2],a1=D4[rA+(klo+8)/2],b0=D4[rB+klo/2],b1=D4[rB+(klo+8)/2];
+    T[((((size_t)e*80+j)*7+g)<<8)+wi] = ((a0&0xFu)^8u)|(((b0&0xFu)^8u)<<4)|(((a1&0xFu)^8u)<<8)|(((b1&0xFu)^8u)<<12)
+        |((uint32_t)((a0>>4)^8u)<<16)|((uint32_t)((b0>>4)^8u)<<20)|((uint32_t)((a1>>4)^8u)<<24)|((uint32_t)((b1>>4)^8u)<<28);
+}
+__global__ void k_repack_sgu(const float* GS,const float* US,float2* S2){            // grid(64,10): {gate,up} scale per (g,r)
+    int e=blockIdx.x,g=blockIdx.y;
+    for(int r=threadIdx.x;r<MOEI;r+=256) S2[((size_t)e*10+g)*MOEI+r]=make_float2(GS[((size_t)e*MOEI+r)*10+g],US[((size_t)e*MOEI+r)*10+g]);
+}
+__global__ void k_repack_sd(const float* DS,float2* S2){                             // grid(64,7): {sc(d),sc(d+8)} per (g, j*8+rl)
+    int e=blockIdx.x,g=blockIdx.y;
+    for(int i=threadIdx.x;i<H/2;i+=256){ int d=16*(i>>3)+(i&7);
+        S2[((size_t)e*7+g)*(H/2)+i]=make_float2(DS[((size_t)e*H+d)*7+g],DS[((size_t)e*H+d+8)*7+g]); }
+}
+static void repack_mma(Layer&ly){
+    CK(cudaMalloc(&ly.egu4t,(size_t)NEXP*112*10*1024)); CK(cudaMalloc(&ly.ed4t,(size_t)NEXP*80*7*1024));
+    CK(cudaMalloc(&ly.sgu2,(size_t)NEXP*10*MOEI*8));    CK(cudaMalloc(&ly.sd2,(size_t)NEXP*7*(H/2)*8));
+    k_repack_gu<<<dim3(NEXP,112,10),256,0,GS>>>(ly.eg8,ly.eu8,ly.egu4t);
+    k_repack_dn<<<dim3(NEXP,80,7),256,0,GS>>>(ly.ed8,ly.ed4t);
+    k_repack_sgu<<<dim3(NEXP,10),256,0,GS>>>(ly.eg_s,ly.eu_s,ly.sgu2);
+    k_repack_sd<<<dim3(NEXP,7),256,0,GS>>>(ly.ed_s,ly.sd2);
+}
+__global__ void k_repack_lmh(const uint8_t* W4,uint32_t* T){                         // grid(V/16,10) block 256: lm_head tiles (r, r+8)
+    int j=blockIdx.x,g=blockIdx.y,wi=threadIdx.x,lane=(wi>>2)&31;
+    int kb=g*QG+((wi>>7)*4+(wi&3))*16, klo=kb+2*(lane&3);
+    size_t rA=((size_t)16*j+(lane>>2))*(H/2), rB=rA+8*(size_t)(H/2);
+    uint8_t a0=W4[rA+klo/2],a1=W4[rA+(klo+8)/2],b0=W4[rB+klo/2],b1=W4[rB+(klo+8)/2];
+    T[(((size_t)j*10+g)<<8)+wi] = ((a0&0xFu)^8u)|(((b0&0xFu)^8u)<<4)|(((a1&0xFu)^8u)<<8)|(((b1&0xFu)^8u)<<12)
+        |((uint32_t)((a0>>4)^8u)<<16)|((uint32_t)((b0>>4)^8u)<<20)|((uint32_t)((a1>>4)^8u)<<24)|((uint32_t)((b1>>4)^8u)<<28);
+}
+__global__ void k_repack_slmh(const float* S,float2* S2,int Vn){                     // grid(10): {sc(r),sc(r+8)} per (g, j*8+rl)
+    int g=blockIdx.x;
+    for(int i=threadIdx.x;i<Vn/2;i+=256){ int d=16*(i>>3)+(i&7);
+        S2[(size_t)g*(Vn/2)+i]=make_float2(S[(size_t)d*10+g],S[((size_t)d+8)*10+g]); }
 }
 // int4 group-128 lm_head GEMV (float out): out[v]=dot(x, deq_g128(W4[v])); warp/row (see k_lmhead_q4_b)
 
@@ -226,11 +267,6 @@ __global__ void k_attn_prefill(const bf16* q,const bf16* k,const bf16* v,bf16* o
         float lg=0,o=0; for(int ww=0;ww<8;ww++){float f=__expf(sm[ww]-mg); lg+=sl[ww]*f; o+=sacc[ww][tid]*f;}
         out[(size_t)i*NH*HD + h*HD + tid]=__float2bfloat16(o/lg); }
 }
-// device-pos counter for graph-captured decode (incremented once per step; wraps in [lo,hi))
-__global__ void k_incpos(int* pos,int lo,int hi){ if(threadIdx.x==0){ int p=*pos+1; if(p>=hi)p=lo; *pos=p; } }
-// fused RoPE + KV store: rope q in qkvb (in place), rope k -> kcache[*pos], copy v -> vcache[*pos].
-// qkvb layout [3H]: q=[0,H) k=[H,2H) v=[2H,3H). <<<NH, HD/2>>>.
-// R-SWA: RoPE at absolute position *pos; K/V written to ring slot pf + ((*pos-pf) mod WIN).
 // seed reference KV from bf16 prefill K/V into the pluggable KV format (bf16 round-trip / fp8 quantize)
 __global__ void k_seedkv(kvt* dst,const bf16* src,size_t n){ size_t i=(size_t)blockIdx.x*256+threadIdx.x; if(i<n) dst[i]=kvst(__bfloat162float(src[i])); }
 __global__ void k_silu_mul(const bf16* g,const bf16* u,bf16* o,int n){
@@ -257,6 +293,9 @@ __global__ void k_combine(bf16* out,const float* Yf,const bf16* shared,int n){
 static void load_weights(){
     EMB=up("model.embed_tokens.weight"); LMH=up("lm_head.weight"); FNORM=up("model.norm.weight");
     quant_q4(LMH,V,H,&LMH4,&lmh_s4); CK(cudaStreamSynchronize(GS));   // int4 lm_head (fast full logits)
+    CK(cudaMalloc(&LMH4T,(size_t)(V/16)*10*1024)); CK(cudaMalloc(&LMH_S2,(size_t)10*(V/2)*8));   // LMHMMA relay
+    k_repack_lmh<<<dim3(V/16,10),256,0,GS>>>(LMH4,LMH4T);
+    k_repack_slmh<<<10,256,0,GS>>>(lmh_s4,LMH_S2,V);
     for(int l=0;l<NL;l++){ std::string p="model.layers."+std::to_string(l)+".";
         L[l].in_norm=up(p+"input_layernorm.weight"); L[l].post_norm=up(p+"post_attention_layernorm.weight");
         L[l].q=up(p+"self_attn.q_proj.weight"); L[l].k=up(p+"self_attn.k_proj.weight");
@@ -285,6 +324,7 @@ static void load_weights(){
             quant_q4(L[l].e_gate,NEXP*MOEI,H,&L[l].eg8,&L[l].eg_s);   // q4 experts
             quant_q4(L[l].e_up,  NEXP*MOEI,H,&L[l].eu8,&L[l].eu_s);
             quant_q4(L[l].e_down,NEXP*H,MOEI,&L[l].ed8,&L[l].ed_s);
+            repack_mma(L[l]);                                         // mma-tiled relay of the SAME nibbles/scales (TCMOE path)
             L[l].sh_gate=up(p+"mlp.shared_experts.gate_proj.weight");
             L[l].sh_up=up(p+"mlp.shared_experts.up_proj.weight");
             L[l].sh_down=up(p+"mlp.shared_experts.down_proj.weight");
@@ -303,17 +343,16 @@ static void load_weights(){
 
 // scratch
 static bf16 *xbuf,*nbuf,*q,*k,*v,*att,*tmp,*mg,*mu,*mh; static float* glog; static int *didx; static float* dw; static float* Yf;
-static kvt *kcache[NL],*vcache[NL]; static int MAXLEN=0; static bf16* qkvb=nullptr; static bf16* gu=nullptr;
+static kvt *kcache[NL],*vcache[NL];
 static void alloc(int S){
     size_t sH=(size_t)S*H;
     if(xbuf){ cudaFree(xbuf);cudaFree(nbuf);cudaFree(q);cudaFree(k);cudaFree(v);cudaFree(att);cudaFree(tmp);   // free-first: repeated calls (Gundam per-page) reuse, no leak
         cudaFree(mg);cudaFree(mu);cudaFree(mh);cudaFree(glog);cudaFree(didx);cudaFree(dw);cudaFree(Yf);
-        for(int l=0;l<NL;l++){cudaFree(kcache[l]);cudaFree(vcache[l]);} cudaFree(qkvb);cudaFree(gu); }
+        for(int l=0;l<NL;l++){cudaFree(kcache[l]);cudaFree(vcache[l]);} }
     CK(cudaMalloc(&xbuf,sH*2));CK(cudaMalloc(&nbuf,sH*2));CK(cudaMalloc(&q,sH*2));CK(cudaMalloc(&k,sH*2));CK(cudaMalloc(&v,sH*2));CK(cudaMalloc(&att,sH*2));CK(cudaMalloc(&tmp,sH*2));
     CK(cudaMalloc(&mg,(size_t)S*DENSEI*2));CK(cudaMalloc(&mu,(size_t)S*DENSEI*2));CK(cudaMalloc(&mh,(size_t)S*DENSEI*2));
     CK(cudaMalloc(&glog,(size_t)S*NEXP*4));CK(cudaMalloc(&didx,(size_t)S*TOPK*4));CK(cudaMalloc(&dw,(size_t)S*TOPK*4));CK(cudaMalloc(&Yf,sH*4));
-    MAXLEN=S; for(int l=0;l<NL;l++){ CK(cudaMalloc(&kcache[l],(size_t)S*H*sizeof(kvt))); CK(cudaMalloc(&vcache[l],(size_t)S*H*sizeof(kvt))); }
-    CK(cudaMalloc(&qkvb,3*(size_t)H*2)); CK(cudaMalloc(&gu,2*(size_t)DENSEI*2));
+    for(int l=0;l<NL;l++){ CK(cudaMalloc(&kcache[l],(size_t)S*H*sizeof(kvt))); CK(cudaMalloc(&vcache[l],(size_t)S*H*sizeof(kvt))); }
 }
 static void mlp_dense(Layer&ly,const bf16* xn,bf16* outY,int S,int interm,bf16* Wg,bf16* Wu,bf16* Wd);
 // MoE/dense block for PREFILL (S>1). Page-parallel decode uses mlp_block_b.
@@ -394,23 +433,8 @@ static void prefill(const int* dids,int S,float* dlogits_last,bool check,std::ve
 }
 
 // ===== integrated vision + tokenizer (no python) =====
-extern bf16* vision_encode(const char* pdf,int page);  // -> device [273,1280] bf16 (vision_enc.cu)
 extern void vis_render_cpu(const char* pdf,int page);  // split render/GPU for interleaving
 extern void vis_upload(); extern void vis_gpu_launch(); extern void vis_gpu_sync(); extern bf16* vis_result();
-// write only the non-visual slots ([bos] + [Multi,page,parsing,.]) directly into the embed buffer;
-// the N*273 visual slots are filled by vision writing straight into the buffer (no staging copies).
-__global__ void k_embed_slots(bf16* out,const bf16* emb,int nvis,int bos,int t0,int t1,int t2,int t3){
-    int slot=blockIdx.x, c=blockIdx.y*256+threadIdx.x; if(c>=H)return;
-    int pos,id; if(slot==0){pos=0;id=bos;} else {int j=slot-1;pos=1+nvis+j;id=(j==0)?t0:(j==1)?t1:(j==2)?t2:t3;}
-    out[(size_t)pos*H+c]=emb[(size_t)id*H+c];
-}
-// build the 277-token prompt embeds: [bos=0][273 visual][document, parsing, .]
-__global__ void k_buildembeds(bf16* out,const bf16* emb,const bf16* vis,int bos,int t0,int t1,int t2){
-    int tok=blockIdx.x,c=blockIdx.y*256+threadIdx.x; if(c>=H)return; size_t o=(size_t)tok*H+c;
-    if(tok==0) out[o]=emb[(size_t)bos*H+c];
-    else if(tok<=273) out[o]=vis[(size_t)(tok-1)*H+c];
-    else { int ti=tok-274,id=(ti==0)?t0:(ti==1)?t1:t2; out[o]=emb[(size_t)id*H+c]; }
-}
 // byte-level BPE decoder (build asset vocab.bin: id -> byte-level utf8 string)
 static std::vector<std::string> g_vocab; static std::map<uint32_t,unsigned char> g_bdec;
 static void load_vocab(const char* path){
@@ -437,7 +461,7 @@ static kvt *kcb[NL]={0},*vcb[NL]={0};
 static float *atb_pm=0,*atb_pl=0,*atb_pacc=0; static bf16 *qkvbb=0; static float* dlogb=0; static int* d_tokb=0;
 __global__ void k_attn_split_b(const bf16* qkvb,const kvt* kc,const kvt* vc,float* pm,float* pl,float* pacc,int pf,const int* dstep,int nsplit,int maxseq,const int* act){
     int h=blockIdx.x, s=blockIdx.y, sp=blockIdx.z, lane=threadIdx.x;
-    int dc=*dstep+1; int clen=pf+(dc<WIN?dc:WIN);
+    int dc=dstep[act[s]]+1; int clen=pf+(dc<WIN?dc:WIN);   // per-slot step (windowed); expression shape kept -> FP codegen identical to the lockstep original
     int chunk=(clen+nsplit-1)/nsplit, j0=sp*chunk, j1=min(clen,j0+chunk);
     int base=(s*NH+h)*nsplit+sp, d0=lane,d1=lane+32,d2=lane+64,d3=lane+96;
     if(j0>=j1){ if(lane==0){pm[base]=-1e30f;pl[base]=0;}      // empty split (ns>keys): write NEUTRAL so merge ignores it
@@ -474,7 +498,7 @@ __global__ void k_attn_merge_b(const float* pm,const float* pl,const float* pacc
     out[(size_t)s*H+h*HD+d]=__float2bfloat16(acc/lsh);
 }
 __global__ void k_rope_store_b(bf16* qkvb,kvt* kc,kvt* vc,int pf,const int* dstep,int maxseq,const int* act){
-    int h=blockIdx.x, s=blockIdx.y, d=threadIdx.x; int step=*dstep;
+    int h=blockIdx.x, s=blockIdx.y, d=threadIdx.x; int step=dstep[act[s]];   // per-slot step (windowed); expression shape kept
     int p=pf+step; float inv=powf(ROPE_THETA,-2.f*d/HD); float ang=p*inv,c=cosf(ang),sn=sinf(ang);
     int rslot=pf+((p-pf)%WIN);
     bf16* q=qkvb+(size_t)s*3*H; bf16* k=q+H; bf16* v=q+2*H;
@@ -489,7 +513,7 @@ __global__ void k_rope_store_b(bf16* qkvb,kvt* kc,kvt* vc,int pf,const int* dste
 // no_repeat_ngram: per stream, ban any token that would complete an n-gram already seen in this stream's
 // output (breaks degeneration loops). Large n -> only long exact repeats (loops) caught, legit short repeats kept.
 __global__ void k_ngram_mask(float* logits,const int* outbuf,const int* dstep,int maxstep,const int* act,int ngram){
-    int a=blockIdx.x, pos=*dstep; if(pos<ngram-1)return;
+    int a=blockIdx.x, pos=dstep[act[a]]; if(pos<ngram-1)return;
     const int* hist=outbuf+(size_t)act[a]*maxstep; float* lg=logits+(size_t)a*V;
     int base=pos-(ngram-1);                                       // current (ngram-1)-gram = hist[base..pos-1]
     for(int j=threadIdx.x;j<base;j+=blockDim.x){                  // scan earlier (ngram-1)-grams
@@ -512,71 +536,6 @@ __global__ void k_pageembeds(bf16* out,const bf16* emb,const bf16* dembeds,int p
     if(slot<=vpp){ int vi=1+p*vpp+(slot-1); out[(size_t)slot*H+c]=dembeds[(size_t)vi*H+c]; return; }   // vpp visual tokens/page
     int ti=slot-(vpp+1), id=(ti==0)?t0:(ti==1)?t1:(ti==2)?t2:t3;
     out[(size_t)slot*H+c]=emb[(size_t)id*H+c];
-}
-// ===== batched BLOCK-DIAGONAL prefill: all N pages [bos+visual+prompt] in one pass, each page attends only itself
-#define PFL 278   // per-page sequence length (1 bos + 273 visual + 4 prompt)
-__global__ void k_pageembeds_all(bf16* out,const bf16* emb,const bf16* dembeds,int N,int bos,int t0,int t1,int t2,int t3){
-    int seq=blockIdx.x, slot=blockIdx.y, c=blockIdx.z*256+threadIdx.x; if(c>=H)return;
-    size_t o=((size_t)seq*PFL+slot)*H+c;
-    if(slot==0){ out[o]=emb[(size_t)bos*H+c]; return; }
-    if(slot<=273){ out[o]=dembeds[(size_t)(1+seq*273+(slot-1))*H+c]; return; }
-    int ti=slot-274, id=(ti==0)?t0:(ti==1)?t1:(ti==2)?t2:t3; out[o]=emb[(size_t)id*H+c];
-}
-__global__ void k_rope_bd(bf16* q,bf16* k,int L){   // per-sequence RoPE position = token_idx % L
-    int t=blockIdx.x, h=blockIdx.y, d=threadIdx.x; int pos=t%L;
-    float inv=powf(ROPE_THETA,-2.f*d/HD); float ang=pos*inv,c=cosf(ang),s=sinf(ang); size_t base=((size_t)t*NH+h)*HD;
-    auto rot=[&](bf16* x){ float a=__bfloat162float(x[base+d]),b=__bfloat162float(x[base+d+HD/2]);
-        x[base+d]=__float2bfloat16(a*c-b*s); x[base+d+HD/2]=__float2bfloat16(b*c+a*s); };
-    rot(q); rot(k);
-}
-__global__ void k_attn_prefill_bd(const bf16* q,const bf16* k,const bf16* v,bf16* out,int L){   // causal WITHIN each sequence
-    int h=blockIdx.x, i=blockIdx.y, tid=threadIdx.x, w=tid>>5, lane=tid&31; int s0=(i/L)*L;
-    float scale=rsqrtf((float)HD); __shared__ float qs[HD],sm[8],sl[8],sacc[8][HD];
-    size_t qb=((size_t)i*NH+h)*HD; for(int x=tid;x<HD;x+=blockDim.x) qs[x]=__bfloat162float(q[qb+x]); __syncthreads();
-    int d0=lane,d1=lane+32,d2=lane+64,d3=lane+96; float q0=qs[d0],q1=qs[d1],q2=qs[d2],q3=qs[d3];
-    float m=-1e30f,l=0,a0=0,a1=0,a2=0,a3=0;
-    for(int j=s0+w;j<=i;j+=8){ const bf16* kj=k+((size_t)j*NH+h)*HD;
-        float p=q0*__bfloat162float(kj[d0])+q1*__bfloat162float(kj[d1])+q2*__bfloat162float(kj[d2])+q3*__bfloat162float(kj[d3]);
-        for(int o=16;o;o>>=1)p+=__shfl_xor_sync(~0u,p,o);
-        float sc=p*scale,mn=fmaxf(m,sc),cr=__expf(m-mn),pe=__expf(sc-mn); const bf16* vj=v+((size_t)j*NH+h)*HD;
-        a0=a0*cr+pe*__bfloat162float(vj[d0]); a1=a1*cr+pe*__bfloat162float(vj[d1]);
-        a2=a2*cr+pe*__bfloat162float(vj[d2]); a3=a3*cr+pe*__bfloat162float(vj[d3]); l=l*cr+pe; m=mn; }
-    if(lane==0){sm[w]=m;sl[w]=l;} sacc[w][d0]=a0;sacc[w][d1]=a1;sacc[w][d2]=a2;sacc[w][d3]=a3; __syncthreads();
-    if(tid<HD){ float mg=-1e30f; for(int ww=0;ww<8;ww++)mg=fmaxf(mg,sm[ww]);
-        float lg=0,o=0; for(int ww=0;ww<8;ww++){float f=__expf(sm[ww]-mg); lg+=sl[ww]*f; o+=sacc[ww][tid]*f;}
-        out[(size_t)i*NH*HD+h*HD+tid]=__float2bfloat16(o/lg); }
-}
-__global__ void k_seedkv_bd(kvt* dst,const bf16* src,int N,int L,int MS){   // (seq s, pos i) -> stream s ref region, slot i
-    size_t g=(size_t)blockIdx.x*256+threadIdx.x; if(g>=(size_t)N*L*H)return;
-    int c=g%H; size_t ti=g/H; int i=ti%L, s=ti/L;
-    dst[(size_t)(s*MS+i)*H+c]=kvst(__bfloat162float(src[ti*H+c]));
-}
-__global__ void k_gather_last(bf16* out,const bf16* nbuf,int L){   // out[s] = nbuf[s*L + L-1] (each seq's last hidden)
-    int s=blockIdx.x, c=blockIdx.y*256+threadIdx.x; if(c>=H)return;
-    out[(size_t)s*H+c]=nbuf[(size_t)(s*PFL+PFL-1)*H+c];
-}
-// one block-diagonal prefill of all N pages -> per-page reference KV in kcb/vcb + first decode token tok0[]
-static void prefill_bd(int N,bf16* emball,kvt** kcb,kvt** vcb,int MS,std::vector<int>& tok0,float* dlog){
-    int S=N*PFL;
-    CK(cudaMemcpyAsync(xbuf,emball,(size_t)S*H*2,cudaMemcpyDeviceToDevice,GS));
-    for(int l=0;l<NL;l++){ Layer&ly=L[l];
-        k_rmsnorm<<<S,256,0,GS>>>(xbuf,ly.in_norm,nbuf,S,H,EPS);
-        lin(nbuf,ly.q,q,S,H,H); lin(nbuf,ly.k,k,S,H,H); lin(nbuf,ly.v,v,S,H,H);
-        k_rope_bd<<<dim3(S,NH),HD/2,0,GS>>>(q,k,PFL);
-        k_seedkv_bd<<<((size_t)S*H+255)/256,256,0,GS>>>(kcb[l],k,N,PFL,MS);
-        k_seedkv_bd<<<((size_t)S*H+255)/256,256,0,GS>>>(vcb[l],v,N,PFL,MS);
-        k_attn_prefill_bd<<<dim3(NH,S),256,0,GS>>>(q,k,v,att,PFL);
-        lin(att,ly.o,tmp,S,H,H);
-        k_add<<<(S*H+255)/256,256,0,GS>>>(xbuf,tmp,S*H);
-        k_rmsnorm<<<S,256,0,GS>>>(xbuf,ly.post_norm,nbuf,S,H,EPS);
-        mlp_block(ly,S);
-        k_add<<<(S*H+255)/256,256,0,GS>>>(xbuf,tmp,S*H);
-    }
-    k_rmsnorm<<<S,256,0,GS>>>(xbuf,FNORM,nbuf,S,H,EPS);
-    k_gather_last<<<dim3(N,(H+255)/256),256,0,GS>>>(att,nbuf,PFL);   // att[0..N) = each page's last hidden
-    lin_f32(att,LMH,dlog,N,H,V);                                     // logits[N,V]
-    std::vector<float> ll((size_t)N*V); CK(cudaMemcpy(ll.data(),dlog,(size_t)N*V*4,cudaMemcpyDeviceToHost));
-    tok0.assign(N,0); for(int p=0;p<N;p++){ const float* r=ll.data()+(size_t)p*V; int t=0; for(int e=1;e<V;e++) if(r[e]>r[t])t=e; tok0[p]=t; }
 }
 // batched int4 MoE: warp per (expert, row); loop the B tokens, compute only those routing to this expert.
 // int4 weights (4x less bytes than the reused bf16 prefill kernel) -> the page-parallel decode bottleneck.
@@ -621,7 +580,167 @@ __global__ void k_gate_b(const bf16* x,const bf16* gateW,float* glog,int B){   /
     for(int o=16;o;o>>=1)acc+=__shfl_xor_sync(~0u,acc,o);
     if(lane==0) glog[(size_t)t*NEXP+e]=acc;
 }
+// ===== TCMOE: tensor-core int4 routed MoE (mma.sync m16n8k16 bf16, fp32 accum, in-register fp32 group scales).
+// A = 16 weight rows (8 gate + 8 up of same r | down: d,d+8), B = 8 tokens. int4 values are EXACT in bf16
+// ((0x4300|m)-136 = m-8), scale applied to the fp32 GROUP partial in registers via the C-fragment row map ->
+// same products as k_moe_*_q4_b, reassociated only. Dispatch: NA>=TCMIN=4 (below, per-token kernels win on the
+// 8-token mma tile's padding waste AND keep the 1pg md5 gates bit-exact). TCDBG=n A/Bs the two on live activations.
+__device__ __forceinline__ uint32_t q2b(uint32_t q){ uint32_t r=(q&0x000F000Fu)|0x43004300u; const uint32_t k=0x43084308u;
+    __nv_bfloat162 x=__hsub2(*(__nv_bfloat162*)&r,*(const __nv_bfloat162*)&k); return *(uint32_t*)&x; }
+__device__ __forceinline__ void mma16816(float* c,uint32_t q,uint32_t b0,uint32_t b1){
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+        :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(q2b(q)),"r"(q2b(q>>4)),"r"(q2b(q>>8)),"r"(q2b(q>>12)),"r"(b0),"r"(b1)); }
+__global__ void k_moe_bins(const int* didx,int* cnt,int* bin,int B,int bs){   // <<<1,64>>>: fixed ascending (t,slot) scan -> deterministic bins
+    int e=threadIdx.x,c=0,n=B*TOPK;
+    for(int i=0;i<n;i++) if(didx[i]==e) bin[e*bs+(c++)]=i;
+    cnt[e]=c; for(int i=c;i<bs;i++) bin[e*bs+i]=0;                            // pad (padded lanes are cnt-guarded)
+}
+// grid (64, NTILES/8, ceil(B/8)), block 128 = 4 warps x 2 m-tiles. GU: KG=10 groups, writes silu(g)*u -> hbuf[ts*MOEI+r].
+// DN: KG=7, writes raw fp32 partials -> part[ts*H+d] (routing weight applied in k_moe_comb_b, fixed slot order).
+__global__ void k_moe_gateup_mma(const bf16* x,const int* cnt,const int* bin,int bs,const uint4* W,const float2* S2,bf16* hbuf){
+    int e=blockIdx.x,w=threadIdx.x>>5,lane=threadIdx.x&31;
+    int c=cnt[e],n0=blockIdx.z*8; if(n0>=c)return;
+    int nn=min(8,c-n0),j0=blockIdx.y*8+w*2;
+    __shared__ bf16 xs[2][8][136]; __shared__ int bn[8];
+    if(threadIdx.x<8) bn[threadIdx.x]=(threadIdx.x<nn)?bin[e*bs+n0+threadIdx.x]:0;
+    __syncthreads();
+    float cf[2][4]={},ac[2][4]={};
+    for(int g=0;g<10;g++){
+        uint32_t* xw=(uint32_t*)xs[g&1];
+        for(int i=threadIdx.x;i<512;i+=128){ int n=i>>6,kw=i&63;
+            xw[n*68+kw]=(n<nn)?((const uint32_t*)(x+(size_t)(bn[n]/TOPK)*H+g*QG))[kw]:0u; }
+        __syncthreads();
+        const uint4* wt0=W+((((size_t)e*112+j0)*10+g)<<6);  uint4 lo0=wt0[lane],hi0=wt0[32+lane];
+        const uint4* wt1=W+((((size_t)e*112+j0+1)*10+g)<<6);uint4 lo1=wt1[lane],hi1=wt1[32+lane];
+        #pragma unroll
+        for(int s=0;s<8;s++){
+            uint32_t q0=s<4?((uint32_t*)&lo0)[s]:((uint32_t*)&hi0)[s-4], q1=s<4?((uint32_t*)&lo1)[s]:((uint32_t*)&hi1)[s-4];
+            uint32_t b0=xw[(lane>>2)*68+s*8+(lane&3)], b1=xw[(lane>>2)*68+s*8+4+(lane&3)];
+            mma16816(cf[0],q0,b0,b1); mma16816(cf[1],q1,b0,b1);
+        }
+        float2 s0=S2[((size_t)e*10+g)*MOEI+8*j0+(lane>>2)], s1=S2[((size_t)e*10+g)*MOEI+8*(j0+1)+(lane>>2)];
+        #pragma unroll
+        for(int i=0;i<2;i++){ ac[0][i]+=s0.x*cf[0][i]; ac[0][i+2]+=s0.y*cf[0][i+2]; ac[1][i]+=s1.x*cf[1][i]; ac[1][i+2]+=s1.y*cf[1][i+2];
+            cf[0][i]=cf[0][i+2]=cf[1][i]=cf[1][i+2]=0; }
+    }
+    int t0=2*(lane&3),t1=t0+1;
+    #pragma unroll
+    for(int q=0;q<2;q++){ int r=8*(j0+q)+(lane>>2); float g0=ac[q][0],g1=ac[q][1];
+        if(t0<nn) hbuf[(size_t)bn[t0]*MOEI+r]=__float2bfloat16(g0/(1.f+__expf(-g0))*ac[q][2]);
+        if(t1<nn) hbuf[(size_t)bn[t1]*MOEI+r]=__float2bfloat16(g1/(1.f+__expf(-g1))*ac[q][3]); }
+}
+__global__ void k_moe_down_mma(const bf16* hb,const int* cnt,const int* bin,int bs,const uint4* W,const float2* S2,float* part){
+    int e=blockIdx.x,w=threadIdx.x>>5,lane=threadIdx.x&31;
+    int c=cnt[e],n0=blockIdx.z*8; if(n0>=c)return;
+    int nn=min(8,c-n0),j0=blockIdx.y*8+w*2;
+    __shared__ bf16 xs[2][8][136]; __shared__ int bn[8];
+    if(threadIdx.x<8) bn[threadIdx.x]=(threadIdx.x<nn)?bin[e*bs+n0+threadIdx.x]:0;
+    __syncthreads();
+    float cf[2][4]={},ac[2][4]={};
+    for(int g=0;g<7;g++){
+        uint32_t* xw=(uint32_t*)xs[g&1];
+        for(int i=threadIdx.x;i<512;i+=128){ int n=i>>6,kw=i&63;
+            xw[n*68+kw]=(n<nn)?((const uint32_t*)(hb+(size_t)bn[n]*MOEI+g*QG))[kw]:0u; }
+        __syncthreads();
+        const uint4* wt0=W+((((size_t)e*80+j0)*7+g)<<6);  uint4 lo0=wt0[lane],hi0=wt0[32+lane];
+        const uint4* wt1=W+((((size_t)e*80+j0+1)*7+g)<<6);uint4 lo1=wt1[lane],hi1=wt1[32+lane];
+        #pragma unroll
+        for(int s=0;s<8;s++){
+            uint32_t q0=s<4?((uint32_t*)&lo0)[s]:((uint32_t*)&hi0)[s-4], q1=s<4?((uint32_t*)&lo1)[s]:((uint32_t*)&hi1)[s-4];
+            uint32_t b0=xw[(lane>>2)*68+s*8+(lane&3)], b1=xw[(lane>>2)*68+s*8+4+(lane&3)];
+            mma16816(cf[0],q0,b0,b1); mma16816(cf[1],q1,b0,b1);
+        }
+        float2 s0=S2[((size_t)e*7+g)*(H/2)+j0*8+(lane>>2)], s1=S2[((size_t)e*7+g)*(H/2)+(j0+1)*8+(lane>>2)];
+        #pragma unroll
+        for(int i=0;i<2;i++){ ac[0][i]+=s0.x*cf[0][i]; ac[0][i+2]+=s0.y*cf[0][i+2]; ac[1][i]+=s1.x*cf[1][i]; ac[1][i+2]+=s1.y*cf[1][i+2];
+            cf[0][i]=cf[0][i+2]=cf[1][i]=cf[1][i+2]=0; }
+    }
+    int t0=2*(lane&3),t1=t0+1;
+    #pragma unroll
+    for(int q=0;q<2;q++){ int d=16*(j0+q)+(lane>>2);
+        if(t0<nn){ part[(size_t)bn[t0]*H+d]=ac[q][0]; part[(size_t)bn[t0]*H+d+8]=ac[q][2]; }
+        if(t1<nn){ part[(size_t)bn[t1]*H+d]=ac[q][1]; part[(size_t)bn[t1]*H+d+8]=ac[q][3]; } }
+}
+__global__ void k_moe_comb_b(const float* part,const float* dw,float* Yf,int B){   // det: fixed slot order, single write
+    int t=blockIdx.x,d=blockIdx.y*256+threadIdx.x; if(d>=H)return; float s=0;
+    for(int sl=0;sl<TOPK;sl++) s+=dw[t*TOPK+sl]*part[(size_t)(t*TOPK+sl)*H+d];
+    Yf[(size_t)t*H+d]=s;
+}
+static int *tc_cnt=0,*tc_bin=0; static float* tc_part=0; static int tc_bs=0;   // TCMOE scratch (generate_pagepar-owned)
+// ===== LMHMMA: exact-rescore int4 lm_head for na>=5 (replaces the 331MB bf16 cuBLAS GEMM/step).
+// int4 mma ranking (83MB) -> ngram mask -> per-block top-4 candidates (1024/token) -> bf16 rescore of
+// candidates only (fp32 accum) -> argmax. Emitted token == bf16-lm_head argmax iff the true argmax is in the
+// int4 top-1024 (single-stream variant: always was). Banned (ngram) tokens keep -1e30 through the rescore.
+__global__ void k_lmhead_mma(const bf16* x,const uint4* W,const float2* S2,float* out,int B){   // grid(V/128, ceil(B/8)), block 128
+    int w=threadIdx.x>>5,lane=threadIdx.x&31,n0=blockIdx.y*8;
+    int nn=min(8,B-n0),j0=blockIdx.x*8+w*2;
+    __shared__ bf16 xs[2][8][136];
+    float cf[2][4]={},ac[2][4]={};
+    for(int g=0;g<10;g++){
+        uint32_t* xw=(uint32_t*)xs[g&1];
+        for(int i=threadIdx.x;i<512;i+=128){ int n=i>>6,kw=i&63;
+            xw[n*68+kw]=(n<nn)?((const uint32_t*)(x+(size_t)(n0+n)*H+g*QG))[kw]:0u; }
+        __syncthreads();
+        const uint4* wt0=W+(((size_t)j0*10+g)<<6);    uint4 lo0=wt0[lane],hi0=wt0[32+lane];
+        const uint4* wt1=W+(((size_t)(j0+1)*10+g)<<6);uint4 lo1=wt1[lane],hi1=wt1[32+lane];
+        #pragma unroll
+        for(int s=0;s<8;s++){
+            uint32_t q0=s<4?((uint32_t*)&lo0)[s]:((uint32_t*)&hi0)[s-4], q1=s<4?((uint32_t*)&lo1)[s]:((uint32_t*)&hi1)[s-4];
+            uint32_t b0=xw[(lane>>2)*68+s*8+(lane&3)], b1=xw[(lane>>2)*68+s*8+4+(lane&3)];
+            mma16816(cf[0],q0,b0,b1); mma16816(cf[1],q1,b0,b1);
+        }
+        float2 s0=S2[(size_t)g*(V/2)+j0*8+(lane>>2)], s1=S2[(size_t)g*(V/2)+(j0+1)*8+(lane>>2)];
+        #pragma unroll
+        for(int i=0;i<2;i++){ ac[0][i]+=s0.x*cf[0][i]; ac[0][i+2]+=s0.y*cf[0][i+2]; ac[1][i]+=s1.x*cf[1][i]; ac[1][i+2]+=s1.y*cf[1][i+2];
+            cf[0][i]=cf[0][i+2]=cf[1][i]=cf[1][i+2]=0; }
+    }
+    int t0=2*(lane&3),t1=t0+1;
+    #pragma unroll
+    for(int q=0;q<2;q++){ int r=16*(j0+q)+(lane>>2);
+        if(t0<nn){ out[(size_t)(n0+t0)*V+r]=ac[q][0]; out[(size_t)(n0+t0)*V+r+8]=ac[q][2]; }
+        if(t1<nn){ out[(size_t)(n0+t1)*V+r]=ac[q][1]; out[(size_t)(n0+t1)*V+r+8]=ac[q][3]; } }
+}
+#define NBAM 256
+#define LMTOPK 4
+__global__ void k_topk_blocks_b(const float* logits,int* cand,int Vn){   // grid(NBAM,na): per-block top-4 of token by; dyn smem chunk
+    int b=blockIdx.x,t=threadIdx.x; const float* lg=logits+(size_t)blockIdx.y*Vn;
+    int chunk=(Vn+NBAM-1)/NBAM, base=b*chunk, end=min(Vn,base+chunk), n=end-base;
+    extern __shared__ float sv[];
+    for(int i=t;i<n;i+=blockDim.x) sv[i]=lg[base+i];
+    __syncthreads();
+    __shared__ float rv[256]; __shared__ int ri[256];
+    for(int k=0;k<LMTOPK;k++){
+        float lv=-1e30f; int li=-1;
+        for(int i=t;i<n;i+=blockDim.x) if(sv[i]>lv){lv=sv[i];li=i;}
+        rv[t]=lv; ri[t]=li; __syncthreads();
+        for(int o=128;o;o>>=1){ if(t<o&&rv[t+o]>rv[t]){rv[t]=rv[t+o];ri[t]=ri[t+o];} __syncthreads(); }
+        if(t==0){ cand[((size_t)blockIdx.y*NBAM+b)*LMTOPK+k]=(ri[0]>=0)?base+ri[0]:base; if(ri[0]>=0)sv[ri[0]]=-1e30f; }
+        __syncthreads();
+    }
+}
+__global__ void k_rescore_b(const bf16* x,const bf16* W,const float* logits,const int* cand,float* out,int B){ // warp/(t,cand); bf16 dot, fp32 accum
+    long gw=(long)blockIdx.x*(blockDim.x/32)+(threadIdx.x>>5); int lane=threadIdx.x&31;
+    const int nc=NBAM*LMTOPK; if(gw>=(long)B*nc)return;
+    int c=gw%nc; long t=gw/nc; int v=cand[(size_t)t*nc+c];
+    if(logits[(size_t)t*V+v]<=-1e29f){ if(!lane)out[(size_t)t*nc+c]=-1e30f; return; }   // ngram ban survives rescore
+    const bf16* wr=W+(size_t)v*H; const bf16* xt=x+(size_t)t*H; float aa[4]={0,0,0,0};
+    for(int i=lane;i<H;i+=128){
+        #pragma unroll
+        for(int j=0;j<4;j++){ int ii=i+j*32; if(ii<H) aa[j]+=__bfloat162float(xt[ii])*__bfloat162float(wr[ii]); } }
+    float acc=(aa[0]+aa[1])+(aa[2]+aa[3]);
+    for(int o=16;o;o>>=1)acc+=__shfl_xor_sync(~0u,acc,o);
+    if(!lane)out[(size_t)t*nc+c]=acc;
+}
+__global__ void k_argmax_cand_b(const float* val,const int* cand,int* tok){   // grid(na): winner among 1024 candidates
+    const int nc=NBAM*LMTOPK; int t=blockIdx.x,x=threadIdx.x; float bv=-1e30f; int bi=0;
+    for(int i=x;i<nc;i+=256){ float v=val[(size_t)t*nc+i]; if(v>bv){bv=v;bi=i;} }
+    __shared__ float sv[256]; __shared__ int si[256]; sv[x]=bv; si[x]=bi; __syncthreads();
+    for(int o=128;o;o>>=1){ if(x<o&&sv[x+o]>sv[x]){sv[x]=sv[x+o];si[x]=si[x+o];} __syncthreads(); }
+    if(!x)tok[t]=cand[(size_t)t*nc+si[0]];
+}
+static int *lmh_cand=0; static float* lmh_cval=0;                             // LMHMMA scratch (generate_pagepar-owned)
 #define PPSMALL 3   // NA<=PPSMALL: fp8/int4 per-token kernels (fast at small batch / single page); above: cuBLAS bf16
+#define TCMIN   4   // NA>=TCMIN: tensor-core int4 MoE (mma tile = 8 tokens; below, padding waste loses to the per-token kernels)
 __global__ void k_gemv_fp8_b(const bf16*,const uint8_t*,const float*,bf16*,int,int,int);          // fwd decl
 __global__ void k_gemv_fp8_bias_b(const bf16*,const uint8_t*,const float*,const float*,bf16*,int,int,int);
 __global__ void k_swiglu_fp8_b(const bf16*,const uint8_t*,const float*,bf16*,int,int);
@@ -637,8 +756,28 @@ static void mlp_block_b(Layer&ly,int B){          // int4 routed MoE always; den
     }
     k_gate_b<<<(B*NEXP+7)/8,256,0,GS>>>(nbuf,ly.gate,glog,B);
     k_route<<<B,NEXP,0,GS>>>(glog,didx,dw,B);
+    static int tcdbg=[](){const char* s=getenv("TCDBG");return s?atoi(s):0;}();  // A/B vs small-batch kernels (needs DECNOGRAPH=1)
+    if(B>=TCMIN && tc_bin){                                                      // tensor-core int4 MoE (reassociated fp32; small B keeps per-token kernels + bit-exact 1pg gates)
+        k_moe_bins<<<1,NEXP,0,GS>>>(didx,tc_cnt,tc_bin,B,tc_bs);
+        int nt=(B+7)/8;
+        k_moe_gateup_mma<<<dim3(NEXP,14,nt),128,0,GS>>>(nbuf,tc_cnt,tc_bin,tc_bs,(const uint4*)ly.egu4t,ly.sgu2,mh);
+        k_moe_down_mma<<<dim3(NEXP,10,nt),128,0,GS>>>(mh,tc_cnt,tc_bin,tc_bs,(const uint4*)ly.ed4t,ly.sd2,tc_part);
+        k_moe_comb_b<<<dim3(B,(H+255)/256),256,0,GS>>>(tc_part,dw,Yf,B);
+        if(tcdbg>0){ tcdbg--;                                                    // compare vs old kernels on the same nbuf/didx/dw
+            bf16* mh2=(bf16*)mg; float* yf2=(float*)mu;
+            k_moe_gateup_q4_b<<<(B*TOPK*MOEI+7)/8,256,0,GS>>>(nbuf,didx,ly.eg8,ly.eg_s,ly.eu8,ly.eu_s,mh2,B,MOEI);
+            k_moe_down_q4_b<<<(B*H+7)/8,256,0,GS>>>(mh2,didx,dw,ly.ed8,ly.ed_s,yf2,B,MOEI);
+            CK(cudaStreamSynchronize(GS));
+            int nmh=B*TOPK*MOEI,nyf=B*H; std::vector<bf16> a(nmh),b(nmh); std::vector<float> ya(nyf),yb(nyf);
+            CK(cudaMemcpy(a.data(),mh,(size_t)nmh*2,cudaMemcpyDeviceToHost)); CK(cudaMemcpy(b.data(),mh2,(size_t)nmh*2,cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(ya.data(),Yf,(size_t)nyf*4,cudaMemcpyDeviceToHost)); CK(cudaMemcpy(yb.data(),yf2,(size_t)nyf*4,cudaMemcpyDeviceToHost));
+            float dm=0,dy=0; for(int i=0;i<nmh;i++)dm=fmaxf(dm,fabsf(__bfloat162float(a[i])-__bfloat162float(b[i])));
+            for(int i=0;i<nyf;i++)dy=fmaxf(dy,fabsf(ya[i]-yb[i]));
+            printf("TCDBG L%d B%d mh|Δ|max %.3e Yf|Δ|max %.3e\n",(int)(&ly-L),B,dm,dy); }
+    } else {
     k_moe_gateup_q4_b<<<(B*TOPK*MOEI+7)/8,256,0,GS>>>(nbuf,didx,ly.eg8,ly.eg_s,ly.eu8,ly.eu_s,mh,B,MOEI);
     k_moe_down_q4_b<<<(B*H+7)/8,256,0,GS>>>(mh,didx,dw,ly.ed8,ly.ed_s,Yf,B,MOEI);   // deterministic: writes all Yf, no pre-zero
+    }
     if(sm){ k_swiglu_fp8_b<<<SWIGBT(SHI,B),256,0,GS>>>(nbuf,ly.shgu8,ly.shgu_s,mh,B,SHI);
             k_gemv_fp8_bias_b<<<GEMVBT(H,B),256,0,GS>>>(mh,ly.shd8,ly.shd_s,Yf,tmp,B,H,SHI); }
     else  { mlp_dense(ly,nbuf,att,B,SHI,ly.sh_gate,ly.sh_up,ly.sh_down); k_combine<<<(B*H+255)/256,256,0,GS>>>(tmp,Yf,att,B*H); }
@@ -656,11 +795,6 @@ __global__ void k_lmhead_q4_b(const bf16* x,const uint8_t* W4,const float* scale
         for(int o=16;o;o>>=1)acc+=__shfl_xor_sync(~0u,acc,o);
         if(lane==0)out[(size_t)t*V+row]=acc; }
 }
-// DEQUANT-ONCE batched fp8 projections: warp per (row, token-chunk). Unpack each fp8 weight element ONCE,
-// reuse across the chunk's tokens (acc[] in regs). Fixes "fp8 loses when batched" — per-token kernels
-// re-unpack the weight B times; here unpack cost is amortized across the chunk, so fp8's byte saving holds.
-// grid = rows * ceil(B/TBG) warps.  PPNCH(B,TB) = ceil(B/TB) (defined above mlp_block_b).
-__device__ __forceinline__ float deq8(uint8_t c){ return __half2float(__nv_cvt_fp8_to_halfraw(c,__NV_E4M3)); }
 // per-token fp8 projections (warp per (token,row)) — fastest at SMALL batch (used for NA<=PPSMALL / single-page)
 __global__ void k_gemv_fp8_b(const bf16* x,const uint8_t* W8,const float* scale,bf16* out,int B,int rows,int cols){
     long gw=(long)blockIdx.x*(blockDim.x/32)+(threadIdx.x>>5); int lane=threadIdx.x&31; if(gw>=(long)B*rows)return;
@@ -681,48 +815,64 @@ __global__ void k_swiglu_fp8_b(const bf16* x,const uint8_t* Wgu,const float* sca
     float u=dot_fp8_vec(Wgu+(size_t)(interm+r)*H,xt,H)*scale[interm+r];
     if(lane==0) out[(size_t)t*interm+r]=__float2bfloat16((g/(1.f+__expf(-g)))*u);
 }
-__global__ void k_record_b(int* outbuf,const int* tok,const int* dstep,int maxstep,const int* act){ int s=blockIdx.x; outbuf[(size_t)act[s]*maxstep+*dstep]=tok[s]; }
+__global__ void k_record_b(int* outbuf,const int* tok,const int* dstep,int maxstep,const int* act){ int ps=act[blockIdx.x]; outbuf[(size_t)ps*maxstep+dstep[ps]]=tok[blockIdx.x]; }
 __global__ void k_setdone_b(int* done,const int* tok,const int* act){ int s=blockIdx.x; if(threadIdx.x==0 && tok[s]==1) done[act[s]]=1; }
-static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& po,int vpp=273){
+__global__ void k_incstep_b(int* steps,const int* act){ steps[act[blockIdx.x]]++; }   // per-slot decode position (windowed admission)
+// Page-parallel batched decode with WINDOWED admission: at most W page-streams resident (slots); pages
+// beyond W are encoded+prefilled lazily into slots freed by finished streams -> unlimited page count at
+// flat VRAM (= W*(PF+WIN) KV entries/layer). encpg(page,dst) writes page's vpp visual embeds on demand;
+// without it (or N<=W) all pages are admitted upfront = the classic full-batch behavior (md5 gates run there).
+// Invariants: a stream's positions are 0..PF-1 (its own ref) + PF+step — a pure function of its page, never
+// of admission time; slot recycling frees whole streams (no renumbering); WIN=128 untouched.
+static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& po,int vpp=273,void(*encpg)(int,bf16*)=nullptr){
     const int PF=1+vpp+4, MS=PF+WIN;                     // ref = 1 bos + vpp visual + 4 prompt (273=Base, larger=Gundam)
-    bool bd=getenv("BDPREFILL") && vpp==273;                        // bd prefill assumes PFL=278; N-seq for Gundam
-    alloc(bd?N*PFL:std::max(PF,N));
-    for(int l=0;l<NL;l++){ CK(cudaMalloc(&kcb[l],(size_t)N*MS*H*sizeof(kvt))); CK(cudaMalloc(&vcb[l],(size_t)N*MS*H*sizeof(kvt))); }
-    CK(cudaMalloc(&atb_pm,(size_t)N*NH*NSPLITB*4)); CK(cudaMalloc(&atb_pl,(size_t)N*NH*NSPLITB*4)); CK(cudaMalloc(&atb_pacc,(size_t)N*NH*NSPLITB*HD*4));
-    CK(cudaMalloc(&qkvbb,(size_t)N*3*H*2)); CK(cudaMalloc(&dlogb,(size_t)N*V*4)); CK(cudaMalloc(&d_tokb,(size_t)N*4));
-    std::vector<int> tok0(N);
-    cudaEvent_t pa,pb; cudaEventCreate(&pa);cudaEventCreate(&pb); CK(cudaStreamSynchronize(GS)); cudaEventRecord(pa,GS);
-    if(!bd){                                             // DEFAULT: N sequential per-page prefills
-        bf16* pe; CK(cudaMalloc(&pe,(size_t)PF*H*2)); float* dlog; CK(cudaMalloc(&dlog,(size_t)V*4));
-        for(int p=0;p<N;p++){
-            k_pageembeds<<<dim3(PF,(H+255)/256),256,0,GS>>>(pe,EMB,dembeds,p,0,37460,4366,76466,16,vpp);
-            prefill(nullptr,PF,dlog,false,nullptr,pe);
-            for(int l=0;l<NL;l++){ CK(cudaMemcpyAsync(kcb[l]+(size_t)p*MS*H,kcache[l],(size_t)PF*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS));
-                                   CK(cudaMemcpyAsync(vcb[l]+(size_t)p*MS*H,vcache[l],(size_t)PF*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS)); }
-            std::vector<float> ll(V); CK(cudaMemcpy(ll.data(),dlog,(size_t)V*4,cudaMemcpyDeviceToHost));
-            int t=0; for(int e=1;e<V;e++) if(ll[e]>ll[t])t=e; tok0[p]=t;
-        }
-        cudaFree(pe); cudaFree(dlog);
-    } else {                                             // ONE block-diagonal prefill of all pages
-        bf16* emball; CK(cudaMalloc(&emball,(size_t)N*PFL*H*2));
-        k_pageembeds_all<<<dim3(N,PFL,(H+255)/256),256,0,GS>>>(emball,EMB,dembeds,N,0,37460,4366,76466,16);
-        float* dlogN; CK(cudaMalloc(&dlogN,(size_t)N*V*4));
-        prefill_bd(N,emball,kcb,vcb,MS,tok0,dlogN);
-        cudaFree(emball); cudaFree(dlogN);
-    }
-    cudaEventRecord(pb,GS); CK(cudaEventSynchronize(pb)); float pms=0; cudaEventElapsedTime(&pms,pa,pb);
-    printf("page-parallel prefill (%s): %d pages in %.0f ms\n",bd?"block-diag":"N-seq",N,pms);
-    int ns=(PF+WIN)/48; if(ns<1)ns=1; if(ns>NSPLITB)ns=NSPLITB;   // base; recomputed per-NA in loop to fill SMs at small NA
+    static int wcap=[](){const char* s=getenv("WINDOW");return s?atoi(s):128;}();  // resident-stream cap (capacity knob; tok/s scales with batch -> keep high, memory flattens past it)
+    const int W=encpg?std::min(N,std::max(1,wcap)):N;    // no callback -> caller built all embeds upfront -> all resident
+    alloc(std::max(PF,W));
+    for(int l=0;l<NL;l++){ CK(cudaMalloc(&kcb[l],(size_t)W*MS*H*sizeof(kvt))); CK(cudaMalloc(&vcb[l],(size_t)W*MS*H*sizeof(kvt))); }
+    CK(cudaMalloc(&atb_pm,(size_t)W*NH*NSPLITB*4)); CK(cudaMalloc(&atb_pl,(size_t)W*NH*NSPLITB*4)); CK(cudaMalloc(&atb_pacc,(size_t)W*NH*NSPLITB*HD*4));
+    tc_bs=std::max(16,W); CK(cudaMalloc(&tc_cnt,NEXP*4)); CK(cudaMalloc(&tc_bin,(size_t)NEXP*tc_bs*4)); CK(cudaMalloc(&tc_part,(size_t)W*TOPK*H*4));
+    CK(cudaMalloc(&lmh_cand,(size_t)W*NBAM*LMTOPK*4)); CK(cudaMalloc(&lmh_cval,(size_t)W*NBAM*LMTOPK*4));
+    CK(cudaMalloc(&qkvbb,(size_t)W*3*H*2)); CK(cudaMalloc(&dlogb,(size_t)W*V*4)); CK(cudaMalloc(&d_tokb,(size_t)W*4));
     const int MAXSTEP=4096;
-    int *d_step,*outbuf,*d_done,*d_act;                              // batch-shrink: d_act maps active slot -> physical stream
-    CK(cudaMalloc(&d_step,4)); CK(cudaMalloc(&outbuf,(size_t)N*MAXSTEP*4)); CK(cudaMalloc(&d_done,(size_t)N*4)); CK(cudaMalloc(&d_act,(size_t)N*4));
-    CK(cudaMemset(outbuf,0,(size_t)N*MAXSTEP*4));                    // init: the bulk D2H read below copies all MAXSTEP rows, but only `step` are written (rest read only up to each stream's EOS) — keeps initcheck clean
-    int z=0; CK(cudaMemcpy(d_step,&z,4,cudaMemcpyHostToDevice)); CK(cudaMemset(d_done,0,(size_t)N*4));
-    std::vector<int> active, curtok;                                 // initial active set = streams whose first token isn't EOS
-    for(int p=0;p<N;p++) if(tok0[p]!=1){ active.push_back(p); curtok.push_back(tok0[p]); }
+    int *d_steps,*outbuf,*d_done,*d_act;                             // all slot-indexed; d_act maps active idx -> slot
+    CK(cudaMalloc(&d_steps,(size_t)W*4)); CK(cudaMalloc(&outbuf,(size_t)W*MAXSTEP*4)); CK(cudaMalloc(&d_done,(size_t)W*4)); CK(cudaMalloc(&d_act,(size_t)W*4));
+    CK(cudaMemset(outbuf,0,(size_t)W*MAXSTEP*4));                    // slots are re-read up to each stream's own step only; memset keeps initcheck clean
+    CK(cudaMemset(d_steps,0,(size_t)W*4)); CK(cudaMemset(d_done,0,(size_t)W*4));
+    po.assign(N,{});
+    std::vector<int> active,curtok,hsteps(W,0),hdone(W,0),slot2page(W,0),freesl;
+    for(int s=W-1;s>=0;s--) freesl.push_back(s);
+    int nextpg=0; bool ttft=false; float admms=0; long nadm=0;       // cumulative admission (encode+prefill) time
+    bf16 *pe,*vis1=nullptr; float* dlog; CK(cudaMalloc(&pe,(size_t)PF*H*2)); CK(cudaMalloc(&dlog,(size_t)V*4));
+    if(encpg) CK(cudaMalloc(&vis1,(size_t)(1+(size_t)vpp)*H*2));
+    cudaEvent_t pa,pb,aa,ab; cudaEventCreate(&pa);cudaEventCreate(&pb);cudaEventCreate(&aa);cudaEventCreate(&ab);
+    CK(cudaStreamSynchronize(GS)); cudaEventRecord(pa,GS);
+    auto admit=[&](){                                                // fill free slots with the next pages: encode -> prefill -> seed slot KV
+        if((int)active.size()>=W || nextpg>=N) return;
+        cudaEventRecord(aa,GS);
+        while((int)active.size()<W && nextpg<N){
+            int slot=freesl.back();
+            const bf16* src=dembeds; int pidx=nextpg;
+            if(encpg){ encpg(nextpg,vis1+H); src=vis1; pidx=0; }     // slot-local embeds: callback page lives at index 0
+            k_pageembeds<<<dim3(PF,(H+255)/256),256,0,GS>>>(pe,EMB,src,pidx,0,37460,4366,76466,16,vpp);
+            prefill(nullptr,PF,dlog,false,nullptr,pe);
+            for(int l=0;l<NL;l++){ CK(cudaMemcpyAsync(kcb[l]+(size_t)slot*MS*H,kcache[l],(size_t)PF*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS));
+                                   CK(cudaMemcpyAsync(vcb[l]+(size_t)slot*MS*H,vcache[l],(size_t)PF*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS)); }
+            std::vector<float> ll(V); CK(cudaMemcpy(ll.data(),dlog,(size_t)V*4,cudaMemcpyDeviceToHost));
+            int t=0; for(int e=1;e<V;e++) if(ll[e]>ll[t])t=e; po[nextpg].push_back(t);
+            if(!ttft){ ttft=true; cudaEventRecord(pb,GS); CK(cudaEventSynchronize(pb)); float ms=0; cudaEventElapsedTime(&ms,pa,pb);
+                       printf("TTFT (page 0 %sprefill): %.0f ms\n",encpg?"encode+":"",ms); }
+            if(t!=1){ freesl.pop_back(); slot2page[slot]=nextpg; hsteps[slot]=0; hdone[slot]=0; active.push_back(slot); curtok.push_back(t); }
+            nextpg++; nadm++;
+        }
+        cudaEventRecord(ab,GS); CK(cudaEventSynchronize(ab)); float ms=0; cudaEventElapsedTime(&ms,aa,ab); admms+=ms;
+    };
+    admit();                                             // initial fill: first W pages (windowed) or all (classic)
+    printf("page-parallel prefill: %ld/%d pages in %.0f ms%s\n",nadm,N,admms,W<N?" (windowed)":"");
     int NA=(int)active.size();
     CK(cudaMemcpy(d_act,active.data(),(size_t)NA*4,cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_tokb,curtok.data(),(size_t)NA*4,cudaMemcpyHostToDevice));
+    int ns=(PF+WIN)/48; if(ns<1)ns=1; if(ns>NSPLITB)ns=NSPLITB;   // base; recomputed per-NA in loop to fill SMs at small NA
     const int ngram=16;                                            // no_repeat_ngram (always on; kills degeneration loops, safe for clean docs)
     static void* cubws=nullptr; if(!cubws)CK(cudaMalloc(&cubws,(size_t)32<<20)); CB(cublasSetWorkspace(CUB,cubws,(size_t)32<<20)); // persistent workspace (cuBLAS holds the ptr -> must NOT free)
     auto body=[&](int na){                                          // one decode step captured as a graph, replayed per window
@@ -731,8 +881,8 @@ static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& 
         bool sm=(na<=PPSMALL);
         for(int l=0;l<NL;l++){ Layer&ly=L[l];
             if(sm) k_gemv_fp8_b<<<GEMVBT(3*H,na),256,0,GS>>>(nbuf,ly.qkv8,ly.qkv_s,qkvbb,na,3*H,H); else lin(nbuf,ly.qkv,qkvbb,na,H,3*H);
-            k_rope_store_b<<<dim3(NH,na),HD/2,0,GS>>>(qkvbb,kcb[l],vcb[l],PF,d_step,MS,d_act);
-            k_attn_split_b<<<dim3(NH,na,ns),32,0,GS>>>(qkvbb,kcb[l],vcb[l],atb_pm,atb_pl,atb_pacc,PF,d_step,ns,MS,d_act);
+            k_rope_store_b<<<dim3(NH,na),HD/2,0,GS>>>(qkvbb,kcb[l],vcb[l],PF,d_steps,MS,d_act);
+            k_attn_split_b<<<dim3(NH,na,ns),32,0,GS>>>(qkvbb,kcb[l],vcb[l],atb_pm,atb_pl,atb_pacc,PF,d_steps,ns,MS,d_act);
             k_attn_merge_b<<<dim3(NH,na),HD,0,GS>>>(atb_pm,atb_pl,atb_pacc,att,ns);
             if(sm) k_gemv_fp8_b<<<GEMVBT(H,na),256,0,GS>>>(att,ly.o8,ly.o_s,tmp,na,H,H); else lin(att,ly.o,tmp,na,H,H);
             k_add_rmsnorm<<<na,256,0,GS>>>(xbuf,tmp,ly.post_norm,nbuf,H,EPS);   // fused residual+norm
@@ -740,47 +890,88 @@ static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& 
             const bf16* nn=(l+1<NL)?L[l+1].in_norm:FNORM;
             k_add_rmsnorm<<<na,256,0,GS>>>(xbuf,tmp,nn,nbuf,H,EPS);             // fused residual+norm
         }
-        if(na<=4) k_lmhead_q4_b<<<(V+7)/8,256,0,GS>>>(nbuf,LMH4,lmh_s4,dlogb,na);
-        else      lin_f32(nbuf,LMH,dlogb,na,H,V);
-        k_ngram_mask<<<na,256,0,GS>>>(dlogb,outbuf,d_step,MAXSTEP,d_act,ngram);          // no_repeat_ngram (always on)
-        k_argmax_b<<<na,256,0,GS>>>(dlogb,d_tokb,V);
-        k_record_b<<<na,1,0,GS>>>(outbuf,d_tokb,d_step,MAXSTEP,d_act);
+        static int lmhdbg=[](){const char* s=getenv("LMHDBG");return s?atoi(s):0;}();     // token-parity A/B vs bf16 cuBLAS full logits (needs DECNOGRAPH)
+        bool lmx=(na>4 && lmh_cand);                                                      // exact-rescore path (token-exact vs cuBLAS, verified)
+        if(lmx) k_lmhead_mma<<<dim3(V/128,(na+7)/8),128,0,GS>>>(nbuf,(const uint4*)LMH4T,LMH_S2,dlogb,na);   // int4 ranking, 83MB vs 331MB
+        else    k_lmhead_q4_b<<<(V+7)/8,256,0,GS>>>(nbuf,LMH4,lmh_s4,dlogb,na);
+        k_ngram_mask<<<na,256,0,GS>>>(dlogb,outbuf,d_steps,MAXSTEP,d_act,ngram);         // no_repeat_ngram (always on; masks BEFORE candidates)
+        if(lmx){
+            k_topk_blocks_b<<<dim3(NBAM,na),256,((V+NBAM-1)/NBAM)*4,GS>>>(dlogb,lmh_cand,V);
+            k_rescore_b<<<(int)(((long)na*NBAM*LMTOPK+7)/8),256,0,GS>>>(nbuf,LMH,dlogb,lmh_cand,lmh_cval,na);
+            k_argmax_cand_b<<<na,256,0,GS>>>(lmh_cval,lmh_cand,d_tokb);
+            if(lmhdbg>0){ lmhdbg--;                                                      // old path on same nbuf -> token parity
+                static float* dbglog=0; static int* dbgtok=0;
+                if(!dbglog){CK(cudaMalloc(&dbglog,(size_t)na*V*4));CK(cudaMalloc(&dbgtok,na*4));}
+                lin_f32(nbuf,LMH,dbglog,na,H,V);
+                k_ngram_mask<<<na,256,0,GS>>>(dbglog,outbuf,d_steps,MAXSTEP,d_act,ngram);
+                k_argmax_b<<<na,256,0,GS>>>(dbglog,dbgtok,V);
+                CK(cudaStreamSynchronize(GS));
+                std::vector<int> tn(na),to(na);
+                CK(cudaMemcpy(tn.data(),d_tokb,na*4,cudaMemcpyDeviceToHost)); CK(cudaMemcpy(to.data(),dbgtok,na*4,cudaMemcpyDeviceToHost));
+                int mm=0; for(int i=0;i<na;i++) mm+=(tn[i]!=to[i]);
+                if(mm) printf("LMHDBG na%d MISMATCH %d/%d\n",na,mm,na); }
+        }
+        else k_argmax_b<<<na,256,0,GS>>>(dlogb,d_tokb,V);
+        k_record_b<<<na,1,0,GS>>>(outbuf,d_tokb,d_steps,MAXSTEP,d_act);
         k_setdone_b<<<na,1,0,GS>>>(d_done,d_tokb,d_act);
-        k_incpos<<<1,1,0,GS>>>(d_step,0,1<<30);
+        k_incstep_b<<<na,1,0,GS>>>(d_steps,d_act);
     };
     std::map<int,cudaGraphExec_t> gcache;                           // one captured step-graph per active-count (NA=14 bulk reuses one)
     cudaEvent_t da,db; cudaEventCreate(&da);cudaEventCreate(&db); CK(cudaStreamSynchronize(GS)); cudaEventRecord(da,GS);
-    int step=0; const int CK_EVERY=16; long stream_steps=0; bool ng=getenv("DECNOGRAPH");
-    while(NA>0 && step<MAXSTEP){
-        ns=std::min(NSPLITB,std::max((PF+WIN)/48,(284+NH*NA-1)/(NH*NA)));   // more key-splits at small NA to fill the 142 SMs
+    long wsteps=0; const int CK_EVERY=16; long stream_steps=0; bool ng=getenv("DECNOGRAPH");
+    auto retire=[&](int slot){                                       // stream done: harvest its outbuf row into its page, free the slot
+        int n=hsteps[slot]; std::vector<int>& out=po[slot2page[slot]];
+        if(n>0){ std::vector<int> row(n); CK(cudaMemcpy(row.data(),outbuf+(size_t)slot*MAXSTEP,(size_t)n*4,cudaMemcpyDeviceToHost));
+                 for(int t:row){ out.push_back(t); if(t==1)break; } }
+        freesl.push_back(slot);
+    };
+    while(NA>0){
+        ns=std::min(NSPLITB,std::max((PF+WIN)/48,(284+NH*NA-1)/(NH*NA)));   // more key-splits at small NA to fill the 142 SMs (24 keys/split tried 2026-07: +1% = noise, 0.12% output drift -> reverted)
         if(!ng && !gcache.count(NA)){ cudaGraph_t g; CK(cudaStreamBeginCapture(GS,cudaStreamCaptureModeThreadLocal)); body(NA);
             CK(cudaStreamEndCapture(GS,&g)); cudaGraphExec_t ge; CK(cudaGraphInstantiate(&ge,g,nullptr,nullptr,0)); cudaGraphDestroy(g); gcache[NA]=ge; }
-        int nstep=std::min(CK_EVERY,MAXSTEP-step);
-        for(int i=0;i<nstep;i++,step++){ stream_steps+=NA; if(ng)body(NA); else CK(cudaGraphLaunch(gcache[NA],GS)); }
-        CK(cudaStreamSynchronize(GS));                               // recompact: drop streams that hit EOS
-        std::vector<int> dn(N); CK(cudaMemcpy(dn.data(),d_done,(size_t)N*4,cudaMemcpyDeviceToHost));
+        int hi=0; for(int s:active) hi=std::max(hi,hsteps[s]);       // outbuf rows are MAXSTEP deep -> cap the window at the furthest stream
+        int nstep=std::min(CK_EVERY,MAXSTEP-hi);
+        for(int i=0;i<nstep;i++,wsteps++){ stream_steps+=NA; if(ng)body(NA); else CK(cudaGraphLaunch(gcache[NA],GS)); }
+        CK(cudaStreamSynchronize(GS));                               // recompact: retire streams that hit EOS (or the per-stream step cap)
+        CK(cudaMemcpy(hdone.data(),d_done,(size_t)W*4,cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hsteps.data(),d_steps,(size_t)W*4,cudaMemcpyDeviceToHost));
         std::vector<int> ct(NA); CK(cudaMemcpy(ct.data(),d_tokb,(size_t)NA*4,cudaMemcpyDeviceToHost));
         std::vector<int> na, nt;
-        for(int a=0;a<NA;a++){ int s=active[a]; if(!dn[s]){ na.push_back(s); nt.push_back(ct[a]); } }
-        active=na; NA=(int)active.size();
-        if(NA>0){ CK(cudaMemcpy(d_act,active.data(),(size_t)NA*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_tokb,nt.data(),(size_t)NA*4,cudaMemcpyHostToDevice)); }
+        for(int a=0;a<NA;a++){ int s=active[a]; if(hdone[s]||hsteps[s]>=MAXSTEP) retire(s); else { na.push_back(s); nt.push_back(ct[a]); } }
+        active=na; curtok=nt;
+        admit();                                                     // top the window back up (no-op when all pages already admitted)
+        NA=(int)active.size();
+        if(NA>0){ CK(cudaMemcpy(d_act,active.data(),(size_t)NA*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_tokb,curtok.data(),(size_t)NA*4,cudaMemcpyHostToDevice));
+                  CK(cudaMemcpy(d_steps,hsteps.data(),(size_t)W*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_done,hdone.data(),(size_t)W*4,cudaMemcpyHostToDevice)); }
     }
     cudaEventRecord(db,GS); CK(cudaEventSynchronize(db)); float dms=0; cudaEventElapsedTime(&dms,da,db);
-    std::vector<int> ob((size_t)N*MAXSTEP); CK(cudaMemcpy(ob.data(),outbuf,(size_t)N*MAXSTEP*4,cudaMemcpyDeviceToHost));
-    po.assign(N,{}); long total=0;
-    for(int p=0;p<N;p++){ po[p].push_back(tok0[p]); if(tok0[p]!=1) for(int j=0;j<step;j++){ int t=ob[(size_t)p*MAXSTEP+j]; po[p].push_back(t); if(t==1)break; } total+=po[p].size(); }
-    printf("page-parallel decode: %ld tok in %.0f ms (%.0f tok/s), %d steps, %.0f%% batch util\n",total,dms,total*1000.0/dms,step,100.0*total/stream_steps);
+    long total=0; for(int p=0;p<N;p++) total+=(long)po[p].size();
+    printf("page-parallel decode: %ld tok in %.0f ms (%.0f tok/s), %ld steps, %.0f%% batch util\n",total,dms,total*1000.0/dms,wsteps,100.0*total/stream_steps);
+    if(W<N) printf("windowed: %d pages through %d slots, %ld admissions %.0f ms interleaved (KV resident: %d x %d entries/layer)\n",N,W,nadm,admms,W,MS);
     for(auto&kv:gcache) cudaGraphExecDestroy(kv.second);                 // free per-call GPU scratch (Gundam calls this per page)
     for(int l=0;l<NL;l++){ cudaFree(kcb[l]); cudaFree(vcb[l]); kcb[l]=nullptr; vcb[l]=nullptr; }
     cudaFree(atb_pm); cudaFree(atb_pl); cudaFree(atb_pacc); atb_pm=atb_pl=atb_pacc=nullptr;
+    cudaFree(tc_cnt); cudaFree(tc_bin); cudaFree(tc_part); tc_cnt=tc_bin=nullptr; tc_part=nullptr;
+    cudaFree(lmh_cand); cudaFree(lmh_cval); lmh_cand=nullptr; lmh_cval=nullptr;
     cudaFree(qkvbb); cudaFree(dlogb); cudaFree(d_tokb); qkvbb=nullptr; dlogb=nullptr; d_tokb=nullptr;
-    cudaFree(d_step); cudaFree(outbuf); cudaFree(d_done); cudaFree(d_act);   // (cubws is persistent: cuBLAS holds it)
+    cudaFree(d_steps); cudaFree(outbuf); cudaFree(d_done); cudaFree(d_act);  // (cubws is persistent: cuBLAS holds it)
+    cudaFree(pe); cudaFree(dlog); if(vis1)cudaFree(vis1);
+    cudaEventDestroy(pa);cudaEventDestroy(pb);cudaEventDestroy(aa);cudaEventDestroy(ab);cudaEventDestroy(da);cudaEventDestroy(db);
 }
 void gundam_vfix();
+static const char* g_pdf=nullptr; static int g_N=0, g_vrend=-1;      // page-encode callback state (windowed admission)
+static void enc_base(int p,bf16* dst){                               // encode page p (base 1024, 273 tok); prefetch-renders p+1 on CPU
+    if(g_vrend!=p){ vis_render_cpu(g_pdf,p); vis_upload(); }
+    vis_gpu_launch();
+    if(p+1<g_N) vis_render_cpu(g_pdf,p+1);                           // CPU render overlaps the GPU encode
+    vis_gpu_sync();
+    CK(cudaMemcpy(dst,vis_result(),(size_t)273*H*2,cudaMemcpyDeviceToDevice));
+    if(p+1<g_N){ vis_upload(); g_vrend=p+1; }
+}
 int main(int argc,char**argv){
     if(getenv("GUNDAM_VFIX")){ gundam_vfix(); return 0; }
     CB(cublasCreate(&CUB));
-    CK(cudaStreamCreate(&GS)); CB(cublasSetStream(CUB,GS)); CK(cudaMalloc(&d_pos,4));
+    CK(cudaStreamCreate(&GS)); CB(cublasSetStream(CUB,GS));
     ST.load("/home/janitor/unlimited-ocr/engine/manifest.tsv");
     printf("KV cache backend: %s\n", KV_NAME);
     printf("loading weights to GPU...\n"); load_weights(); CK(cudaDeviceSynchronize());
@@ -816,22 +1007,8 @@ int main(int argc,char**argv){
         printf("\n===== OCR (GUNDAM, %d page(s), %d tokens) =====\n%s\n",N,(int)allkeep.size(),bpe_decode(allkeep).c_str());
         return 0;
     }
-    int nvis=N*273, Se=1+nvis+4;                              // [bos][N*273 visual][Multi page parsing.]
-    bf16* dembeds; CK(cudaMalloc(&dembeds,(size_t)Se*H*2));
-    k_embed_slots<<<dim3(5,(H+255)/256),256>>>(dembeds,EMB,nvis,0,37460,4366,76466,16);
-    cudaEvent_t va,vb; cudaEventCreate(&va); cudaEventCreate(&vb); cudaEventRecord(va,0);
-    vis_render_cpu(pdf,0); vis_upload();                      // render page 0
-    for(int i=0;i<N;i++){
-        vis_gpu_launch();                                    // GPU encodes page i (async, CUDA graph)
-        if(i+1<N) vis_render_cpu(pdf,i+1);                   // CPU renders page i+1 -- overlaps GPU(i)
-        vis_gpu_sync();
-        CK(cudaMemcpy(dembeds+(size_t)(1+i*273)*H,vis_result(),(size_t)273*H*2,cudaMemcpyDeviceToDevice));
-        if(i+1<N) vis_upload();
-    }
-    CK(cudaDeviceSynchronize());
-    cudaEventRecord(vb,0); CK(cudaEventSynchronize(vb)); float vms=0; cudaEventElapsedTime(&vms,va,vb);
-    printf("vision: %.0f ms (%.0f ms/page)\n", vms, vms/N);
-    std::vector<std::vector<int>> po; generate_pagepar(N,dembeds,po);   // the only decode path: page-parallel (works for N>=1)
+    g_pdf=pdf; g_N=N; g_vrend=-1;                             // vision is encoded lazily per admission (enc_base), overlapped CPU render
+    std::vector<std::vector<int>> po; generate_pagepar(N,nullptr,po,273,enc_base);   // the only decode path: page-parallel, windowed admission
     load_vocab("/home/janitor/unlimited-ocr/engine/vocab.bin");
     std::vector<int> keep; for(auto&pg:po) for(int t:pg) if(t!=1) keep.push_back(t);
     printf("\n===== OCR (%d page(s), %d tokens) =====\n%s\n", N, (int)keep.size(), bpe_decode(keep).c_str());

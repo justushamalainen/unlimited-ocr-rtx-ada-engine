@@ -73,8 +73,9 @@ pass should beat N separate prefills on launch overhead + GPU utilization.
 **Conclusion.** Correct, but **no speedup at any scale** (marginally slower). The prefill is
 **compute-bound on the MoE + projections** — one pass does the same total work as N passes, and the
 per-call launch overhead these kernels would save was never the bottleneck. It also needs `N×278`-row
-buffers (OOM risk on 100+ page docs). So the default stays **N-sequential**; block-diagonal is left
-behind `BDPREFILL=1` only in case a future change makes the prefill launch-bound.
+buffers (OOM risk on 100+ page docs). So the default stays **N-sequential**; block-diagonal was left
+behind `BDPREFILL=1` until 2026-07-02, when windowed admission removed its upfront-embeds input and the
+code was deleted (single-engine policy).
 
 ---
 
@@ -88,5 +89,15 @@ behind `BDPREFILL=1` only in case a future change makes the prefill launch-bound
    **vision encoder**, not the prefill or the context structure.
 
 Scaffolding: Exp-1's `JUMPSEED`/`g_ropebase` was removed when the one-shot `generate` path was
-deleted (page-parallel is now the only decode path). Exp-2's `BDPREFILL` + `*_bd` kernels remain
-(env-gated, in `generate_pagepar`).
+deleted (page-parallel is now the only decode path). Exp-2's `BDPREFILL` + `*_bd` kernels were removed
+2026-07-02 (windowed admission made the upfront-embeds path structurally dead).
+
+## Exp-8: fp8-mma decode projections at batch (2026-07-02) — REJECTED on perf, code removed
+Custom m16n8k16 kernels (fp8-e4m3 weights x bf16 acts, fp32 accum) for qkv/o/dense/shared at NA>3,
+replacing cuBLAS bf16. LUT dequant version -22%; sm_89 hw-cvt f16 version -4% (14pg) / -9% (Gundam-50).
+cuBLAS at tiny-batch GEMV-ish sizes is near the DRAM floor already (96MB L2); halving weight bytes needs
+a cutlass-grade cp.async pipeline to show up. Kernels were numerically correct (sub-ULP vs per-token fp8
+ref), but output drift vs bf16 was 99.85% on the paper PDF and only 92.4% on the small-text brochure
+(850 vs 868 det els) — consistent with fp8 lm_head/vision degrading small text. Rejected on perf; would
+also have struggled on accuracy. Code deleted in the single-engine consolidation (never committed);
+DESIGN.md "FP8MMA" preserves the full design for a rebuild if NA regimes change.
