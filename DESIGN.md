@@ -550,3 +550,19 @@ locks; vision runs on cudaStreamPerThread, so encode must stay on the engine thr
   99% util); 1-page doc arriving mid-decode joins at the next admission boundary and returns in 3.1s
   (vs ~12s drain-then-run); idle 1pg 0.9s e2e. Gates: make check PASS, all 3 md5 BIT-EXACT, gundam-50
   BIT-IDENTICAL, full-SASS diff clean, make servercheck PASS.
+
+## Server-vs-server showdown vs tuned vLLM (2026-07-02/03)
+Saturating multi-document fleets against vLLM (git main dev704) serving the same model, vLLM tuned
+flags-only to its best (615 tok/s @14 conc -> 1207 @224: `--max-num-seqs 256 --max-num-batched-tokens
+16384 --max-model-len 12288 --async-scheduling`; 0.95 util + 32k batched tokens OOM-crashes on vision
+transients; fp8 KV rejected by FlexAttention). vLLM = 1 crop-mode request/page (its best case, client
+renders pages offline); engine = 1 POST/doc to `ocr_bin serve` (renders internally).
+- 16x paper14 (224pg): engine 20.6s, 10,546 tok/s, doc lat 20-21s | vLLM 177.7s, 1,207 tok/s, lat
+  174-178s -> **8.7x**. Mixed 2x14+2x50+1x112 (240pg): 27.3s/9,511 vs 225.1s/1,132 -> **8.4x**.
+- Gundam mode-matched (serialized interludes, our weak spot): 85.2s, 2,538 tok/s -> still 2.1x.
+- Parity coords-stripped: paper 99.4%; brochure gundam-vs-crop 84.4% (cross-stack greedy drift class).
+- AWQ W4A16 community checkpoint in vLLM (attention+experts int4): loads (after fixing a vLLM-side
+  quant-ignore prefix bug) but +23% degeneration bloat, slower wall than bf16, brochure similarity 0.03
+  -> empirically confirms the engine's precision placement (int4 experts + exact-rescore lm_head ONLY;
+  attention stays fp8/bf16). Structural gap: vLLM's floor is bf16 MoE decode + FlexAttention R-SWA
+  (~10x cudagraph tax documented upstream); fleet clients: ../vllm_fleet.py, ../engine_fleet.py.
