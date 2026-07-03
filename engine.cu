@@ -9,6 +9,7 @@
 #include <deque>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -1134,6 +1135,29 @@ std::string ocr_decode_tokens(const std::vector<int>& toks){
     for(int t:toks) if(t!=1) keep.push_back(t);
     return bpe_decode(keep);
 }
+// ===== page quality gates (mirror the viewer; drive server-side auto hi-res) =====
+static const float CONF_T=0.80f, LOW_T=0.20f;   // low-confidence: mean top-1 prob < 0.80 or >20% of steps p1<0.5
+// Repetition/degeneration: a page decoded into a loop (e.g. an incrementing counter) evades exact
+// no-repeat-ngram AND keeps HIGH token confidence. Digit runs -> '#', then flag if 8-word shingles
+// are mostly non-unique. Matches web/index.html degeneratePages().
+static bool is_degenerate(const std::string& t){
+    if(t.size()<3000) return false;
+    std::vector<std::string> w; std::string cur; bool indig=false;
+    for(unsigned char c:t){
+        if(isspace(c)){ if(!cur.empty()){w.push_back(cur);cur.clear();} indig=false; }
+        else if(isdigit(c)){ if(!indig){cur+='#';indig=true;} }
+        else { cur+=(char)c; indig=false; }
+    }
+    if(!cur.empty())w.push_back(cur);
+    if(w.size()<200) return false;
+    std::unordered_set<std::string> g;
+    for(size_t i=0;i+8<=w.size();i++){ std::string s; for(int k=0;k<8;k++){ s+=w[i+k]; s+=' '; } g.insert(s); }
+    return (double)g.size()/(double)(w.size()-7) < 0.35;
+}
+static bool page_flagged(const std::vector<int>& toks,float conf,float lowf){
+    if(conf>0 && (conf<CONF_T || lowf>LOW_T)) return true;       // hesitant hallucination
+    return is_degenerate(ocr_decode_tokens(toks));               // confident loop (conf stays high)
+}
 struct QueueSrc final : PageSrc{
     struct Item{ std::shared_ptr<OcrJob> job; int page; int pdfpage; std::vector<int> toks; float conf=0,lowf=0; };  // page = job-relative slot; pdfpage = actual page in the PDF
     std::unordered_map<int,Item> items; int nid=0;         // live (admittable/in-flight) items only
@@ -1149,9 +1173,10 @@ struct QueueSrc final : PageSrc{
             n=(int)j->pagelist.size();
         } else { n=total; if(j->npages>0 && j->npages<n) n=j->npages; }
         j->pages=n; j->pending=n; j->page_toks.assign(n,{});
-        j->page_conf.assign(n,0.f); j->page_lowfrac.assign(n,0.f);
+        j->page_conf.assign(n,0.f); j->page_lowfrac.assign(n,0.f); j->pdfpages.assign(n,0);
         std::deque<int> pend;
-        for(int p=0;p<n;p++){ items[nid]=Item{j,p,j->pagelist.empty()?p:j->pagelist[p],{}}; pend.push_back(nid); nid++; }
+        for(int p=0;p<n;p++){ int pdfp=j->pagelist.empty()?p:j->pagelist[p]; j->pdfpages[p]=pdfp;
+            items[nid]=Item{j,p,pdfp,{}}; pend.push_back(nid); nid++; }
         rr.push_back(std::move(pend));
     }
     void pump(){ std::shared_ptr<OcrJob> j; while((j=srv_take_base())) expand(std::move(j)); }
@@ -1186,6 +1211,19 @@ struct QueueSrc final : PageSrc{
         j->page_toks[it.page]=std::move(it.toks);
         j->page_conf[it.page]=it.conf; j->page_lowfrac[it.page]=it.lowf;
         if(--j->pending==0){
+            if(j->auto_hires && !j->gundam && !j->retried){   // AUTO HI-RES: re-OCR flagged base pages in gundam before returning
+                std::vector<int> bad;
+                for(int i=0;i<j->pages;i++)
+                    if(page_flagged(j->page_toks[i],j->page_conf[i],j->page_lowfrac[i])) bad.push_back(i);
+                if(!bad.empty() && (int)bad.size()<=512){       // convert this job into a gundam re-pass of just the flagged pages
+                    j->retry_jobrel=bad;
+                    std::vector<int> pl; pl.reserve(bad.size()); for(int i:bad) pl.push_back(j->pdfpages[i]);
+                    j->pagelist=std::move(pl); j->gundam=true; j->retried=true;
+                    vis_doc_close(j->path.c_str()); if(g_pf_pdf==j->path) enc_invalidate();
+                    srv_reenqueue_front(std::move(j));          // engine_serve runs it as a gundam interlude, then merges + completes
+                    return;
+                }
+            }
             long tk=0; for(auto&p:j->page_toks) for(int t:p) if(t!=1)tk++;
             j->tokens=tk;
             vis_doc_close(j->path.c_str());                // spool paths get recycled: never serve a stale doc
@@ -1206,10 +1244,16 @@ static void run_gundam_job(std::shared_ptr<OcrJob> j){
             for(int p:j->pagelist){ if(p>=total){ j->status=400; j->err="page "+std::to_string(p+1)+" out of range (document has "+std::to_string(total)+")"; break; } pgs.push_back(p); }
         } else { int n=total; if(j->npages>0 && j->npages<n) n=j->npages; for(int p=0;p<n;p++)pgs.push_back(p); }
         if(j->status==200){
-            j->pages=(int)pgs.size();
-            std::vector<std::vector<int>> po;
-            if(!ocr_gundam(j->path.c_str(),pgs,po,&j->page_conf,&j->page_lowfrac)){ j->status=422; j->err="page render/encode failed"; }
-            else{
+            std::vector<std::vector<int>> po; std::vector<float> gc,gl;
+            if(!ocr_gundam(j->path.c_str(),pgs,po,&gc,&gl)){ j->status=422; j->err="page render/encode failed"; }
+            else if(j->retried){                           // AUTO HI-RES merge: overwrite ONLY the flagged pages of the base result
+                j->truncated=0;
+                for(size_t k=0;k<j->retry_jobrel.size()&&k<po.size();k++){ int i=j->retry_jobrel[k];
+                    j->page_toks[i]=std::move(po[k]); j->page_conf[i]=gc[k]; j->page_lowfrac[i]=gl[k]; }
+                long tk=0; for(auto&p:j->page_toks){ if(!p.empty()&&p.back()!=1)j->truncated++; for(int t:p) if(t!=1)tk++; }
+                j->tokens=tk;
+            } else {                                       // direct gundam request: page_toks = the (listed) pages
+                j->pages=(int)pgs.size(); j->page_conf=std::move(gc); j->page_lowfrac=std::move(gl);
                 long tk=0; for(auto&p:po){ if(!p.empty()&&p.back()!=1)j->truncated++; for(int t:p) if(t!=1)tk++; }
                 j->tokens=tk; j->page_toks=std::move(po);
             }

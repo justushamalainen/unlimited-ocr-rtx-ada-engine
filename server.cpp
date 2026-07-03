@@ -49,12 +49,16 @@ bool srv_wait_work(){
     g_qcv.wait(lk,[]{return !g_q.empty();});
     return !g_q.front()->gundam;
 }
+void srv_reenqueue_front(std::shared_ptr<OcrJob> j){   // engine thread: auto-hires re-pass jumps ahead of new base work
+    { std::lock_guard<std::mutex> lk(g_qm); g_q.push_front(j); }
+    g_qcv.notify_one();
+}
 void srv_complete(std::shared_ptr<OcrJob> j){
     double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-j->t_enq).count();
     (j->status==200?g_done:g_failed)++;
     float cm=0; for(float c:j->page_conf) cm+=c; if(!j->page_conf.empty()) cm/=j->page_conf.size();
     printf("[job] %s pages=%d tok=%ld trunc=%d conf=%.2f status=%d %.0f ms\n",
-           j->gundam?"gundam":"base",j->pages,j->tokens,j->truncated,cm,j->status,ms);
+           j->retried?"auto-hires":j->gundam?"gundam":"base",j->pages,j->tokens,j->truncated,cm,j->status,ms);
     fflush(stdout);
     { std::lock_guard<std::mutex> lk(j->m); j->done=true; }
     j->cv.notify_all();
@@ -209,6 +213,7 @@ static void handle(int fd){
         }
     }
     if(qparam(r.query,"gundam",v)) gundam=(v=="1");
+    bool autohires=true; if(qparam(r.query,"auto",v)) autohires=(v!="0");   // server re-OCRs flagged base pages in gundam before returning
     if(queue_depth()>=QCAP){ resp(fd,503,"Service Unavailable","queue full\n","Retry-After: 10\r\n"); return; }
     if(r.expect100){ const char* c="HTTP/1.1 100 Continue\r\n\r\n"; if(!send_all(fd,c,strlen(c))){ close(fd); return; } }
     // spool body (header carryover first, then stream)
@@ -236,7 +241,7 @@ static void handle(int fd){
         else close(fd);                                    // client vanished mid-upload: no response owed
         return; }
     // enqueue + wait (v1: no cancel — a disconnected client's job completes and is discarded)
-    auto j=std::make_shared<OcrJob>(); j->path=path; j->npages=npages; j->gundam=gundam; j->pagelist=std::move(pagelist);
+    auto j=std::make_shared<OcrJob>(); j->path=path; j->npages=npages; j->gundam=gundam; j->pagelist=std::move(pagelist); j->auto_hires=autohires;
     if(!enqueue(j)){ unlink(path); resp(fd,503,"Service Unavailable","queue full\n","Retry-After: 10\r\n"); return; }
     { std::unique_lock<std::mutex> lk(j->m); j->cv.wait(lk,[&]{return j->done;}); }
     unlink(path);

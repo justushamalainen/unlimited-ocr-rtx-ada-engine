@@ -63,6 +63,15 @@ if [ -f "$BIG" ]; then
   [ $rc -eq 0 ] && echo "  OK (112-page headers clean)"
 else echo "  SKIP (no paper_x8.pdf)"; fi
 
+echo "== server-side auto hi-res (base job re-OCRs low-conf pages in gundam before returning) =="
+BROCH="$HOME/unlimited-ocr/testdata/reaktor_mkt.pdf"   # small-text brochure: base flags pages 1-2, server upgrades them
+if [ -f "$BROCH" ]; then
+  ca=$(curl -sS --max-time 120 --data-binary @"$BROCH" "$U/ocr?pages=4&auto=0" -D - -o /dev/null | grep -i x-page-conf: | grep -oE '[0-9.]+' | head -1)
+  cb=$(curl -sS --max-time 120 --data-binary @"$BROCH" "$U/ocr?pages=4"        -D - -o /dev/null | grep -i x-page-conf: | grep -oE '[0-9.]+' | head -1)
+  echo "  page1 conf: auto=off $ca -> auto=on(default) $cb"
+  awk "BEGIN{exit !($ca<0.80 && $cb>$ca+0.08)}" && echo "  OK (server auto-upgraded flagged page)" || fail "auto hi-res did not upgrade a flagged page ($ca -> $cb)"
+else echo "  SKIP (no reaktor_mkt.pdf)"; fi
+
 echo "== gundam windowing (>old 64-page cap must NOT 413; VRAM bounded by window) =="
 if [ -f "$BIG" ]; then   # paper_x8 = 112 pages; gundam-decode 68 (over the removed cap) -> 200, not 413
   code=$(curl -sS --max-time 600 --data-binary @"$BIG" "$U/ocr?pages=68&gundam=1" -o $T/gwin.txt -D $T/gwin.h -w '%{http_code}')

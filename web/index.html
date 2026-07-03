@@ -254,6 +254,7 @@ async function annotate(retryList){
   else{
     const p = parseInt($('pages').value); if(p>=1) q.set('pages', p);
     if($('gundam').checked) q.set('gundam','1');
+    if(!$('autohires').checked) q.set('auto','0');   // server auto-re-OCRs flagged pages in gundam unless disabled
   }
   $('run').disabled = true;
   const t0 = performance.now();
@@ -291,10 +292,9 @@ async function annotate(retryList){
       hideHint();
       if(!$('gundam').checked){
         const bad = pageTexts.map((_,i)=>verdict(i).bad?i+1:0).filter(Boolean);
-        if(bad.length){
-          const anyLoop = bad.some(p=>repSet.has(p));
-          if($('autohires').checked && bad.length<=AUTO_MAX){ renderPage(cur); return annotate(bad); }  // auto-switch flagged pages to high-res
-          const why = bad.length>AUTO_MAX ? `${bad.length} low-quality pages (too many to auto-retry)` : (anyLoop?'repeating pattern (loop)':'low decode confidence');
+        if(bad.length){                                    // the server auto-re-OCRs flagged pages (?auto default on);
+          const anyLoop = bad.some(p=>repSet.has(p));       // anything still flagged is either auto-off or gundam-unfixable
+          const why = $('autohires').checked ? 'still low quality after high-res' : (anyLoop?'repeating pattern (loop)':'low decode confidence');
           showHint(bad, why);
         }
       }
