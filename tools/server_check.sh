@@ -63,6 +63,14 @@ if [ -f "$BIG" ]; then
   [ $rc -eq 0 ] && echo "  OK (112-page headers clean)"
 else echo "  SKIP (no paper_x8.pdf)"; fi
 
+echo "== gundam windowing (>old 64-page cap must NOT 413; VRAM bounded by window) =="
+if [ -f "$BIG" ]; then   # paper_x8 = 112 pages; gundam-decode 68 (over the removed cap) -> 200, not 413
+  code=$(curl -sS --max-time 600 --data-binary @"$BIG" "$U/ocr?pages=68&gundam=1" -o $T/gwin.txt -D $T/gwin.h -w '%{http_code}')
+  [ "$code" = 200 ] || fail "gundam 68pg -> $code (expected 200; windowing removed the page cap)"
+  grep -q "X-Pages: 68" $T/gwin.h || fail "gundam 68pg X-Pages"
+  [ $rc -eq 0 ] && echo "  OK (68 gundam pages, no cap)"
+else echo "  SKIP (no paper_x8.pdf)"; fi
+
 echo "== annotation viewer statics =="
 curl -sS $U/ | grep -q "annotation viewer" || fail "GET / viewer html"
 [ "$(curl -sS -o /dev/null -w '%{http_code}' $U/pdf.mjs)" = 200 ] || fail "GET /pdf.mjs"

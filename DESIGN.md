@@ -526,12 +526,16 @@ HTTP/1.1 front (POST /ocr[?pages=N][&gundam=1] body=PDF -> text/plain; GET /heal
 lingering close, strict Content-Length, 16-job/64-conn caps -> 503; spool to $TMPDIR/ocr_srv.<pid>).
 Connection threads never touch CUDA/MuPDF — the engine thread is the sole consumer (MuPDF ctx has NULL
 locks; vision runs on cudaStreamPerThread, so encode must stay on the engine thread forever).
-- **Gundam jobs = exclusive interludes**: per-page vpp is heterogeneous, PF is baked into MS/KV/graphs,
-  so gundam can't share slots. When a gundam job reaches the queue head, QueueSrc stops yielding,
-  residents drain, the core returns, `ocr_gundam()` runs (page cap `GUNDAM_PAGE_CAP`=64 guards the
-  W=N upfront alloc — an uncapped request could OOM->exit(1) the whole server), then the base loop
-  re-enters (fresh scratch + graph recapture, ~0.5s). Bounded head-of-line: base jobs behind a queued
-  gundam wait for it.
+- **Gundam jobs = exclusive interludes, now ALSO windowed**: per-page vpp is heterogeneous across
+  DIFFERENT documents, so gundam can't co-batch with base or other docs in one window. But WITHIN a
+  uniform-tiling doc, gundam now uses the same windowed admission as base: `ocr_gundam()` checks page
+  dims are uniform (cheap `gundam_page_ntok`, no encode), then runs `generate_pagepar(N,nullptr,po,nt0,
+  enc_gundam,...,wcap=vram_wcap(nt0))` — per-slot lazy tile-encode streaming through W = min(WINDOW,
+  VRAM-safe) slots. VRAM is bounded by W (not N) -> UNLIMITED gundam pages at flat memory; the old
+  `GUNDAM_PAGE_CAP` is gone. N<=W reproduces the pre-windowing all-upfront path bit-exactly (gundam-50
+  md5 IDENTICAL; verified 68pg@26GB past the old cap). Mixed page sizes fall back to sequential
+  per-page (already flat memory). When a gundam job reaches the queue head, residents drain, the core
+  returns, the interlude runs, then the base loop re-enters. Bounded head-of-line as before.
 - **Determinism contract**: a job on an IDLE server is byte-identical to the CLI (same NA trajectory;
   W=wcap vs min(N,wcap) only caps admission — gated by tools/server_check.sh parity stanzas). Under
   CONCURRENT load, co-batching changes the NA trajectory -> cuBLAS shapes/ns/TCMOE tiling -> argmax

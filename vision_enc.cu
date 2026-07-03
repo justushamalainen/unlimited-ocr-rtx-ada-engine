@@ -616,6 +616,15 @@ int gundam_encode(const char* pdf,int page){                                    
     init_vision(); if(!render_preprocess(pdf,page,120.f))return -1; if(!gundam_render(pdf,page))return -1;
     int nt=gundam_assemble(g_dimg,g_tilesf,g_gw,g_gh,g_gP); CK(cudaStreamSynchronize(VS)); return nt;
 }
+int gundam_page_ntok(const char* pdf,int page){                                       // token count from page dims ONLY (no encode); -1 = unreadable
+    fz_context* ctx=fzctx(); fz_document* doc=fzdoc(pdf); if(!doc)return -1;
+    fz_page* pg=nullptr; fz_var(pg); int nt=-1;
+    fz_try(ctx){ pg=fz_load_page(ctx,doc,page); fz_rect r=fz_bound_page(ctx,pg);
+        int w,h; gundam_ratio(r.x1-r.x0,r.y1-r.y0,&w,&h); nt=h*10*(w*10+1)+273; }   // == gundam_assemble's Lloc+273
+    fz_catch(ctx){ nt=-1; }
+    if(pg)fz_drop_page(ctx,pg);
+    return nt;
+}
 bf16* gundam_result(){ return g_gundam; }
 
 #ifndef OCR_LINK

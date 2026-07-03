@@ -38,13 +38,13 @@ and browse pages with the rendered page on the left (det boxes overlaid, color-c
 type) and the extracted blocks on the right — hovering either side highlights the other.
 The browser renders the PDF locally (bundled pdf.js); only the annotation request hits the GPU.
 
-Responses carry `X-Pages`/`X-Tokens`/`X-Truncated-Pages`/`X-Millis`. Errors: 400 bad request,
-411 missing Content-Length, 413 too large / gundam page cap, 422 unreadable PDF, 501 chunked
-body, 503 queue full (16 jobs) or connection cap (64). One request per connection; send
-`Content-Length` (no chunked bodies). A document OCR'd on an idle server is byte-identical to
-the CLI; under concurrent load, co-batching may flip rare argmax near-ties (see DESIGN.md).
-`GUNDAM_PAGE_CAP` (default 64) bounds gundam requests; `WINDOW` (default 128) bounds resident
-page-streams/VRAM. Gate: `make servercheck`.
+Responses also carry per-page `X-Page-Conf`/`X-Page-LowConf` (decode confidence). Errors: 400 bad
+request, 411 missing Content-Length, 413 too large, 422 unreadable PDF, 501 chunked body, 503 queue
+full (16 jobs) or connection cap (64). One request per connection; send `Content-Length` (no chunked
+bodies). `?pages=N` = first N pages, `?pages=3,7,12` = those pages (selective retry). A document OCR'd
+on an idle server is byte-identical to the CLI; under concurrent load, co-batching may flip rare argmax
+near-ties (see DESIGN.md). Both base AND gundam are windowed — `WINDOW` (default 128, VRAM-capped) bounds
+resident page-streams, so page count is unlimited at flat VRAM in either mode. Gate: `make servercheck`.
 
 Requires CUDA (nvcc, sm_89), cuBLAS, and a local `pymupdf` install (the Makefile links
 `libmupdf` from `.venv/.../pymupdf`). Model weights are loaded at runtime from the

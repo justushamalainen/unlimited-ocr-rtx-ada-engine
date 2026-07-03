@@ -1039,14 +1039,25 @@ struct FixedSrc final : PageSrc{
     void stats(int id,float c,float lf) override { if(conf)(*conf)[id]=c; if(lowf)(*lowf)[id]=lf; }
     bool lazy() override { return encpg!=nullptr; }
 };
+static int window_env(){ static int w=[](){const char* s=getenv("WINDOW");return s?atoi(s):128;}(); return w; }
 static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& po,int vpp=273,void(*encpg)(int,bf16*)=nullptr,
-                             std::vector<float>* conf=nullptr,std::vector<float>* lowf=nullptr){
-    static int wcap=[](){const char* s=getenv("WINDOW");return s?atoi(s):128;}();  // resident-stream cap (capacity knob; tok/s scales with batch -> keep high, memory flattens past it)
+                             std::vector<float>* conf=nullptr,std::vector<float>* lowf=nullptr,int wcap_override=0){
+    int wcap=wcap_override>0?wcap_override:window_env();  // resident-stream cap (capacity knob; tok/s scales with batch -> keep high, memory flattens past it)
     const int W=encpg?std::min(N,std::max(1,wcap)):N;    // no callback -> caller built all embeds upfront -> all resident
     po.assign(N,{});
     if(conf)conf->assign(N,0.f); if(lowf)lowf->assign(N,0.f);
     FixedSrc src; src.N=N; src.dembeds=dembeds; src.po=&po; src.encpg=encpg; src.conf=conf; src.lowf=lowf;
     generate_pagepar_core(src,vpp,W,N);
+}
+// VRAM-safe resident-slot cap for a given reference size (KV = W * MS * H * NL * (K+V) * sizeof(kvt)).
+// Bounds gundam memory by the WINDOW, not the page count -> unlimited gundam pages at flat VRAM.
+static int vram_wcap(int vpp){
+    size_t freeb=0,totalb=0; cudaMemGetInfo(&freeb,&totalb);
+    size_t MS=(size_t)(1+vpp+4)+WIN;
+    size_t per_slot=MS*H*NL*2*sizeof(kvt);              // K+V for all layers, one slot
+    long w=(long)((double)freeb*0.55/per_slot);         // leave 45% for scratch (tc_part/lmh/dlogb ~ per-slot) + vision + headroom
+    if(w<1)w=1; if(w>window_env())w=window_env();
+    return (int)w;
 }
 void gundam_vfix();
 // Base-mode page encode with next-page prefetch. Marker (g_pf_*) = "this (pdf,page) is already
@@ -1068,34 +1079,37 @@ static const char* g_pdf=nullptr; static int g_N=0;                  // CLI page
 static void enc_base(int p,bf16* dst){                               // encode page p (base 1024, 273 tok); prefetch-renders p+1 on CPU
     if(!enc_page(g_pdf,p,(p+1<g_N)?g_pdf:nullptr,p+1,dst)){ fprintf(stderr,"MuPDF render failed: %s page %d\n",g_pdf,p); exit(1); }
 }
-// ===== Gundam OCR of one doc: high-res tiling; BATCHED decode (identical path to Base, vpp=tiles) =====
-// Encodes all pages upfront (uniform tiling -> one batched generate_pagepar; mixed sizes -> sequential
-// fallback). po gets one token stream per page. false = a page failed to render/encode.
+// ===== Gundam OCR of one doc: high-res tiling; WINDOWED decode (same admission as Base, vpp=tiles) =====
+// Uniform tiling -> per-slot lazy encode through the windowed loop: VRAM bounded by W (vram_wcap), NOT by
+// page count -> UNLIMITED gundam pages at flat memory, no page cap. Mixed page sizes -> sequential per-page
+// (already one-page-at-a-time = flat memory). po gets one token stream per page. false = a page failed.
 extern int gundam_encode(const char* pdf,int page); extern bf16* gundam_result();
+extern int gundam_page_ntok(const char* pdf,int page);   // token count from page dims only (no encode)
+static const char* g_gpdf=nullptr; static int g_gnt0=0; static const std::vector<int>* g_gpgs=nullptr;  // enc_gundam callback state
+static void enc_gundam(int id,bf16* dst){                // encode gundam page pgs[id] into a slot's reference (vpp=g_gnt0)
+    int nt=gundam_encode(g_gpdf,(*g_gpgs)[id]);
+    if(nt!=g_gnt0){ fprintf(stderr,"gundam page %d: %d tok != %d (non-uniform mid-stream)\n",(*g_gpgs)[id],nt,g_gnt0); exit(1); }  // dims pre-checked uniform -> unreachable
+    CK(cudaMemcpy(dst,gundam_result(),(size_t)g_gnt0*H*2,cudaMemcpyDeviceToDevice));
+}
 static bool ocr_gundam(const char* pdf,const std::vector<int>& pgs,std::vector<std::vector<int>>& po,
                        std::vector<float>* conf=nullptr,std::vector<float>* lowf=nullptr){
     const int N=(int)pgs.size();
     po.clear();
-    cudaEvent_t va,vb; cudaEventCreate(&va);cudaEventCreate(&vb); cudaEventRecord(va,0);
-    auto fail=[&](bf16* buf){ if(buf)cudaFree(buf); cudaEventDestroy(va); cudaEventDestroy(vb); return false; };  // server calls this per job: don't leak events
-    int nt0=gundam_encode(pdf,pgs[0]);                   // assume uniform page size (same tiling -> same vpp)
-    if(nt0<0)return fail(nullptr);
-    bf16* de; CK(cudaMalloc(&de,(size_t)(1+(size_t)N*nt0)*H*2));
-    CK(cudaMemcpy(de+(size_t)1*H,gundam_result(),(size_t)nt0*H*2,cudaMemcpyDeviceToDevice));
-    bool uniform=true; int pg=1;
-    for(;pg<N;pg++){ int nt=gundam_encode(pdf,pgs[pg]);
-        if(nt<0) return fail(de);
-        if(nt!=nt0){ uniform=false; printf("[gundam] page %d: %d tok != %d -> mixed sizes, sequential fallback\n",pgs[pg],nt,nt0); break; }
-        CK(cudaMemcpy(de+(size_t)(1+(size_t)pg*nt0)*H,gundam_result(),(size_t)nt0*H*2,cudaMemcpyDeviceToDevice)); }
-    cudaEventRecord(vb,0); CK(cudaEventSynchronize(vb)); float vms=0; cudaEventElapsedTime(&vms,va,vb);
+    int nt0=gundam_page_ntok(pdf,pgs[0]); if(nt0<0)return false;   // cheap dims-based tiling check (no encode)
+    bool uniform=true; for(int i=1;i<N;i++){ int nt=gundam_page_ntok(pdf,pgs[i]); if(nt<0)return false; if(nt!=nt0){uniform=false;break;} }
     if(uniform){
-        printf("[gundam] %d pages x %d visual tokens (vision %.0f ms) -> BATCHED decode\n",N,nt0,vms);
-        generate_pagepar(N,de,po,nt0,nullptr,conf,lowf); // SAME batched decode as Base, just bigger references
-    } else {                                             // mixed page sizes: per-size batching is future work; sequential for now
-        po.clear();
+        g_gpdf=pdf; g_gpgs=&pgs; g_gnt0=nt0;                       // WINDOWED: encode+decode stream through vram_wcap slots
+        int wc=vram_wcap(nt0);
+        cudaEvent_t va,vb; cudaEventCreate(&va);cudaEventCreate(&vb); cudaEventRecord(va,0);
+        generate_pagepar(N,nullptr,po,nt0,enc_gundam,conf,lowf,wc);
+        cudaEventRecord(vb,0); CK(cudaEventSynchronize(vb)); float ms=0; cudaEventElapsedTime(&ms,va,vb);
+        printf("[gundam] %d pages x %d visual tokens -> WINDOWED decode (W=%d, %.0f ms)\n",N,nt0,std::min(N,wc),ms);
+        cudaEventDestroy(va);cudaEventDestroy(vb);
+    } else {                                             // mixed page sizes: per-page sequential (flat memory already)
+        printf("[gundam] mixed page sizes -> sequential\n");
         if(conf)conf->assign(N,0.f); if(lowf)lowf->assign(N,0.f);
         for(int p=0;p<N;p++){ int nt=gundam_encode(pdf,pgs[p]);
-            if(nt<0) return fail(de);
+            if(nt<0) return false;
             bf16* gv=gundam_result();
             bf16* d1; CK(cudaMalloc(&d1,(size_t)(1+nt)*H*2)); CK(cudaMemcpy(d1+(size_t)1*H,gv,(size_t)nt*H*2,cudaMemcpyDeviceToDevice));
             std::vector<std::vector<int>> p1; std::vector<float> c1,l1;
@@ -1104,8 +1118,6 @@ static bool ocr_gundam(const char* pdf,const std::vector<int>& pgs,std::vector<s
             if(conf&&!c1.empty())(*conf)[p]=c1[0]; if(lowf&&!l1.empty())(*lowf)[p]=l1[0];
             cudaFree(d1); }
     }
-    cudaFree(de);
-    cudaEventDestroy(va);cudaEventDestroy(vb);
     return true;
 }
 // ===== server mode: continuous multi-document serving over the SAME decode loop =====
@@ -1185,16 +1197,14 @@ struct QueueSrc final : PageSrc{
     bool verbose() override { return false; }
 };
 static void run_gundam_job(std::shared_ptr<OcrJob> j){
-    static int gcap=[](){const char* s=getenv("GUNDAM_PAGE_CAP");return s?atoi(s):64;}();  // VRAM guard: gundam decodes all-resident (W=N)
     enc_invalidate();                                      // gundam encode clobbers the base vision input buffer
-    int total=vis_page_count(j->path.c_str());
+    int total=vis_page_count(j->path.c_str());             // gundam is now windowed (vram_wcap) -> no page cap; VRAM bounded by W
     if(total<=0){ j->status=422; j->err=total<0?"cannot open document":"empty document"; }
     else{
         std::vector<int> pgs;
         if(!j->pagelist.empty()){                          // selective retry: only the listed pages
             for(int p:j->pagelist){ if(p>=total){ j->status=400; j->err="page "+std::to_string(p+1)+" out of range (document has "+std::to_string(total)+")"; break; } pgs.push_back(p); }
         } else { int n=total; if(j->npages>0 && j->npages<n) n=j->npages; for(int p=0;p<n;p++)pgs.push_back(p); }
-        if(j->status==200 && (int)pgs.size()>gcap){ j->status=413; j->err="gundam page cap exceeded (GUNDAM_PAGE_CAP="+std::to_string(gcap)+"); retry only the flagged pages, or raise the cap"; }
         if(j->status==200){
             j->pages=(int)pgs.size();
             std::vector<std::vector<int>> po;

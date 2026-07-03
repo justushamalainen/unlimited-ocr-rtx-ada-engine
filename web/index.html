@@ -108,7 +108,7 @@ $('legend').innerHTML = TYPES.map(t=>`<span><i style="background:var(--c-${t})">
 
 let pdf=null, fileBuf=null, fileName='', pageTexts=[], pageConf=[], pageLow=[], repSet=new Set(), cur=1, npages=0, rendering=false;
 const CONF_T=0.80, LOW_T=0.20;   // decode-confidence flags: mean p1 below / >20% of tokens with p1<0.5
-const AUTO_MAX=48;               // auto/manual hi-res retry batch cap (stays under the engine's GUNDAM_PAGE_CAP)
+const AUTO_MAX=512;              // hi-res retry batch cap = server ?pages= list limit (gundam is windowed now, memory-safe at any count)
 
 // Per-page verdict combining the TWO failure modes (i is 0-based):
 //  - low token confidence  -> hesitant hallucination (garbled chars). Caught by conf.
