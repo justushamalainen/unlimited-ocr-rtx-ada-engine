@@ -43,6 +43,32 @@ curl -sS --data-binary @"$PDF" "$U/ocr?pages=4" -o /dev/null -w '%{http_code}\n'
 wait $P1 $P2 $P3    # NOT bare `wait` — that would also wait on the backgrounded server
 [ "$(cat $T/r1)$(cat $T/r2)$(cat $T/r3)" = 200200200 ] && echo "  OK" || fail "concurrent docs: $(cat $T/r1 $T/r2 $T/r3 | tr '\n' ' ')"
 
+echo "== selective page list =="
+curl -sS --data-binary @"$PDF" "$U/ocr?pages=2,1" -D $T/pl.h -o /dev/null || fail "pages list POST"
+grep -q "X-Pages: 2" $T/pl.h || fail "pages=2,1 -> X-Pages: 2"
+grep -q "X-Page-Conf:" $T/pl.h || fail "X-Page-Conf header missing"
+curl -sS --data-binary @"$PDF" "$U/ocr?pages=2%2C1" -D $T/pe.h -o /dev/null || fail "percent-encoded list POST"
+grep -q "X-Pages: 2" $T/pe.h || fail "pages=2%2C1 (URLSearchParams comma) -> X-Pages: 2"
+[ "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$U/ocr?pages=999,1" --data-binary @"$PDF")" = 400 ] || fail "out-of-range page -> 400"
+[ $rc -eq 0 ] && echo "  OK"
+
+echo "== large-doc response headers (per-page conf; regression: resp() buffer overflow) =="
+BIG="$HOME/unlimited-ocr/testdata/paper_x8.pdf"   # 112 pages -> ~1.1KB of X-Page-Conf/LowConf headers
+if [ -f "$BIG" ]; then
+  curl -sS --max-time 120 --data-binary @"$BIG" "$U/ocr" -D $T/big.h -o $T/big.txt || fail "big-doc POST"
+  grep -q "X-Pages: 112" $T/big.h || fail "big-doc X-Pages"
+  nc=$(grep -i x-page-conf: $T/big.h | tr ',' '\n' | wc -l)
+  [ "$nc" = 112 ] || fail "X-Page-Conf has $nc values (want 112)"
+  python3 -c "import sys; sys.exit(1 if open('$T/big.h','rb').read().count(b'\0') else 0)" || fail "NUL bytes in response headers (resp() over-read)"
+  [ $rc -eq 0 ] && echo "  OK (112-page headers clean)"
+else echo "  SKIP (no paper_x8.pdf)"; fi
+
+echo "== annotation viewer statics =="
+curl -sS $U/ | grep -q "annotation viewer" || fail "GET / viewer html"
+[ "$(curl -sS -o /dev/null -w '%{http_code}' $U/pdf.mjs)" = 200 ] || fail "GET /pdf.mjs"
+[ "$(curl -sS -o /dev/null -w '%{http_code}' $U/pdf.worker.mjs)" = 200 ] || fail "GET /pdf.worker.mjs"
+[ $rc -eq 0 ] && echo "  OK"
+
 echo "== error paths =="
 head -c 4096 /dev/urandom > $T/junk.bin
 [ "$(curl -sS --data-binary @$T/junk.bin $U/ocr -o /dev/null -w '%{http_code}')" = 422 ] || fail "garbage -> 422"

@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <netinet/tcp.h>
 
 static const size_t BODYCAP=256u<<20;      // max upload
@@ -51,8 +52,9 @@ bool srv_wait_work(){
 void srv_complete(std::shared_ptr<OcrJob> j){
     double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-j->t_enq).count();
     (j->status==200?g_done:g_failed)++;
-    printf("[job] %s pages=%d tok=%ld trunc=%d status=%d %.0f ms\n",
-           j->gundam?"gundam":"base",j->pages,j->tokens,j->truncated,j->status,ms);
+    float cm=0; for(float c:j->page_conf) cm+=c; if(!j->page_conf.empty()) cm/=j->page_conf.size();
+    printf("[job] %s pages=%d tok=%ld trunc=%d conf=%.2f status=%d %.0f ms\n",
+           j->gundam?"gundam":"base",j->pages,j->tokens,j->truncated,cm,j->status,ms);
     fflush(stdout);
     { std::lock_guard<std::mutex> lk(j->m); j->done=true; }
     j->cv.notify_all();
@@ -76,11 +78,14 @@ static void linger_close(int fd){                        // drain unread request
     while(drained<(32u<<20) && time(nullptr)-t0<5){ ssize_t k=recv(fd,buf,sizeof buf,0); if(k<=0)break; drained+=k; }
     close(fd);
 }
-static void resp(int fd,int code,const char* reason,const std::string& body,const std::string& extra="",bool head_only=false){
-    char h[512];
-    int n=snprintf(h,sizeof h,"HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %zu\r\n%s\r\n",
-                   code,reason,body.size(),extra.c_str());
-    send_all(fd,h,n); if(!head_only) send_all(fd,body.data(),body.size());
+static void resp(int fd,int code,const char* reason,const std::string& body,const std::string& extra="",bool head_only=false,
+                 const char* ctype="text/plain; charset=utf-8"){
+    char cl[64]; snprintf(cl,sizeof cl,"%zu",body.size());
+    std::string h="HTTP/1.1 "; h+=std::to_string(code); h+=' '; h+=reason;
+    h+="\r\nConnection: close\r\nContent-Type: "; h+=ctype;
+    h+="\r\nContent-Length: "; h+=cl; h+="\r\n"; h+=extra;   // extra can be large (per-page headers) -> std::string, not a fixed buffer
+    h+="\r\n";
+    send_all(fd,h.data(),h.size()); if(!head_only) send_all(fd,body.data(),body.size());
     linger_close(fd);
 }
 
@@ -131,14 +136,31 @@ static bool read_head(int fd,Req& r){                    // recv until CRLFCRLF;
     }
     return true;
 }
+static std::string pctdecode(const std::string& s){     // %XX + '+' -> raw (URLSearchParams encodes ',' as %2C)
+    std::string o; o.reserve(s.size());
+    for(size_t i=0;i<s.size();i++){
+        if(s[i]=='%'&&i+2<s.size()&&isxdigit((unsigned char)s[i+1])&&isxdigit((unsigned char)s[i+2])){
+            o+=(char)strtol(s.substr(i+1,2).c_str(),nullptr,16); i+=2;
+        } else if(s[i]=='+') o+=' '; else o+=s[i];
+    }
+    return o;
+}
 static bool qparam(const std::string& q,const char* key,std::string& out){
     size_t p=0;
     while(p<q.size()){ size_t e=q.find('&',p); if(e==std::string::npos)e=q.size();
         std::string kv=q.substr(p,e-p); size_t eq=kv.find('=');
         std::string k=eq==std::string::npos?kv:kv.substr(0,eq);
-        if(k==key){ out=eq==std::string::npos?"":kv.substr(eq+1); return true; }
+        if(k==key){ out=eq==std::string::npos?"":pctdecode(kv.substr(eq+1)); return true; }
         p=e+1; }
     return false;
+}
+
+// ---- web assets: <dir of binary>/web (server can be started from any cwd) ----
+static std::string g_webdir;
+static void webdir_init(){
+    char buf[512]; ssize_t n=readlink("/proc/self/exe",buf,sizeof buf-1);
+    if(n>0){ buf[n]=0; std::string p(buf); g_webdir=p.substr(0,p.rfind('/'))+"/web"; }
+    else g_webdir="web";
 }
 
 // ---- per-connection handler (socket timeouts already set by the accept loop) ----
@@ -151,18 +173,40 @@ static void handle(int fd){
         char x[128]; snprintf(x,sizeof x,"X-Queue: %d\r\nX-Done: %ld\r\nX-Failed: %ld\r\n",queue_depth(),g_done.load(),g_failed.load());
         resp(fd,200,"OK","ok\n",x,r.method=="HEAD"); return;
     }
-    if(r.path!="/ocr"){ resp(fd,404,"Not Found","unknown path (POST /ocr, GET /healthz)\n"); return; }
+    if(r.method=="GET"||r.method=="HEAD"){                  // annotation-viewer statics (fixed allowlist, no traversal)
+        const char* ct=nullptr; std::string fn;
+        if(r.path=="/"||r.path=="/index.html"){ fn="index.html"; ct="text/html; charset=utf-8"; }
+        else if(r.path=="/pdf.mjs"||r.path=="/pdf.worker.mjs"){ fn=r.path.substr(1); ct="text/javascript"; }
+        if(ct){
+            std::string body; FILE* f=fopen((g_webdir+"/"+fn).c_str(),"rb");
+            if(!f){ resp(fd,404,"Not Found","viewer asset missing (web/ next to the binary)\n"); return; }
+            char b[65536]; size_t k; while((k=fread(b,1,sizeof b,f))>0) body.append(b,k); fclose(f);
+            resp(fd,200,"OK",body,"",r.method=="HEAD",ct); return;
+        }
+    }
+    if(r.path!="/ocr"){ resp(fd,404,"Not Found","unknown path (GET / viewer, POST /ocr, GET /healthz)\n"); return; }
     if(r.method!="POST"){ resp(fd,405,"Method Not Allowed","use POST\n","Allow: POST\r\n"); return; }
     if(r.te){ resp(fd,501,"Not Implemented","chunked bodies unsupported; send Content-Length\n"); return; }
     if(r.dup_cl){ resp(fd,400,"Bad Request","bad Content-Length\n"); return; }
     if(r.clen<0){ resp(fd,411,"Length Required","Content-Length required\n"); return; }
     if((size_t)r.clen>BODYCAP){ resp(fd,413,"Payload Too Large","body over cap\n"); return; }
     // params
-    int npages=-1; bool gundam=false; std::string v;
-    if(qparam(r.query,"pages",v)){
-        if(v.empty()||v.size()>9){ resp(fd,400,"Bad Request","bad pages=\n"); return; }
-        for(char ch:v) if(!isdigit((unsigned char)ch)){ resp(fd,400,"Bad Request","bad pages=\n"); return; }
-        npages=atoi(v.c_str()); if(npages<1){ resp(fd,400,"Bad Request","pages must be >=1\n"); return; }
+    int npages=-1; bool gundam=false; std::string v; std::vector<int> pagelist;
+    if(qparam(r.query,"pages",v)){                       // "N" = first N pages | "3,7,12" = exactly those pages (1-based)
+        if(v.empty()||v.size()>4096){ resp(fd,400,"Bad Request","bad pages=\n"); return; }
+        for(char ch:v) if(!isdigit((unsigned char)ch)&&ch!=','){ resp(fd,400,"Bad Request","bad pages=\n"); return; }
+        if(v.find(',')==std::string::npos){
+            npages=atoi(v.c_str()); if(npages<1){ resp(fd,400,"Bad Request","pages must be >=1\n"); return; }
+        } else {
+            size_t p=0;
+            while(p<v.size()){ size_t e=v.find(',',p); if(e==std::string::npos)e=v.size();
+                std::string tok=v.substr(p,e-p); p=e+1;
+                if(tok.empty()||tok.size()>9){ resp(fd,400,"Bad Request","bad pages= list\n"); return; }
+                int pg=atoi(tok.c_str()); if(pg<1){ resp(fd,400,"Bad Request","pages entries must be >=1\n"); return; }
+                pagelist.push_back(pg-1);
+            }
+            if(pagelist.empty()||pagelist.size()>512){ resp(fd,400,"Bad Request","pages list: 1..512 entries\n"); return; }
+        }
     }
     if(qparam(r.query,"gundam",v)) gundam=(v=="1");
     if(queue_depth()>=QCAP){ resp(fd,503,"Service Unavailable","queue full\n","Retry-After: 10\r\n"); return; }
@@ -192,20 +236,34 @@ static void handle(int fd){
         else close(fd);                                    // client vanished mid-upload: no response owed
         return; }
     // enqueue + wait (v1: no cancel — a disconnected client's job completes and is discarded)
-    auto j=std::make_shared<OcrJob>(); j->path=path; j->npages=npages; j->gundam=gundam;
+    auto j=std::make_shared<OcrJob>(); j->path=path; j->npages=npages; j->gundam=gundam; j->pagelist=std::move(pagelist);
     if(!enqueue(j)){ unlink(path); resp(fd,503,"Service Unavailable","queue full\n","Retry-After: 10\r\n"); return; }
     { std::unique_lock<std::mutex> lk(j->m); j->cv.wait(lk,[&]{return j->done;}); }
     unlink(path);
     double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-j->t_enq).count();
     if(j->status!=200){
-        const char* rs=j->status==413?"Payload Too Large":j->status==422?"Unprocessable Entity":"Internal Server Error";
+        const char* rs=j->status==400?"Bad Request":j->status==413?"Payload Too Large":j->status==422?"Unprocessable Entity":"Internal Server Error";
         resp(fd,j->status,rs,j->err+"\n"); return;
     }
-    std::vector<int> flat; for(auto&p:j->page_toks) flat.insert(flat.end(),p.begin(),p.end());
-    std::string text=ocr_decode_tokens(flat);
+    std::string text;                                    // per-page decode joined by form-feed (\f) — a reliable page
+    for(size_t i=0;i<j->page_toks.size();i++){           // delimiter, unlike the model-emitted <PAGE> which can be
+        std::string pt=ocr_decode_tokens(j->page_toks[i]); // dropped or hallucinated -> segment/conf misalignment
+        for(char&c:pt) if(c=='\f')c=' ';                 // reserve \f (byte-BPE effectively never emits it in doc text)
+        if(i)text+='\f';
+        text+=pt;
+    }
     char x[192]; snprintf(x,sizeof x,"X-Pages: %d\r\nX-Tokens: %ld\r\nX-Truncated-Pages: %d\r\nX-Millis: %.0f\r\n",
                           j->pages,j->tokens,j->truncated,ms);
-    resp(fd,200,"OK",text,x);
+    std::string extra=x;
+    if(!j->page_conf.empty() && j->page_conf.size()<=2048){          // per-page decode confidence (header stays bounded)
+        char n[16]; std::string c="X-Page-Conf: ", l="X-Page-LowConf: ";
+        for(size_t i=0;i<j->page_conf.size();i++){
+            snprintf(n,sizeof n,"%s%.2f",i?",":"",j->page_conf[i]);    c+=n;
+            snprintf(n,sizeof n,"%s%.2f",i?",":"",j->page_lowfrac[i]); l+=n;
+        }
+        extra+=c+"\r\n"+l+"\r\n";
+    }
+    resp(fd,200,"OK",text,extra);
 }
 
 // ---- spool dir: per-pid, sweep dirs of dead pids (fail-fast exit(1) leaves orphans) ----
@@ -225,13 +283,15 @@ static void spool_init(){
     mkdir(p,0700); g_spool=p;
 }
 
-int server_start(int port){
+int server_start(int port,const char* bind_addr){
     signal(SIGPIPE,SIG_IGN);
+    webdir_init();
     spool_init();
     int lfd=socket(AF_INET,SOCK_STREAM,0);
     if(lfd<0){ perror("socket"); exit(1); }
     int one=1; setsockopt(lfd,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
     sockaddr_in a{}; a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_ANY); a.sin_port=htons((uint16_t)port);
+    if(bind_addr && inet_pton(AF_INET,bind_addr,&a.sin_addr)!=1){ fprintf(stderr,"bad bind address: %s\n",bind_addr); exit(1); }  // e.g. 127.0.0.1 behind a TLS proxy
     if(bind(lfd,(sockaddr*)&a,sizeof a)<0){ perror("bind"); exit(1); }
     if(listen(lfd,SOMAXCONN)<0){ perror("listen"); exit(1); }
     socklen_t al=sizeof a; getsockname(lfd,(sockaddr*)&a,&al);

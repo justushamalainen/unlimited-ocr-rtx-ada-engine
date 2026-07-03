@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unlimited OCR — annotation viewer</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --line:#e3e6ea; --ink:#1c2733; --mut:#5c6b7a;
+    --acc:#2563eb; --hl:#fde047;
+    --c-text:#2563eb; --c-title:#dc2626; --c-header:#dc2626; --c-image:#059669;
+    --c-image_caption:#0d9488; --c-table:#7c3aed; --c-equation:#db2777;
+    --c-list:#0284c7; --c-ref_text:#64748b; --c-page_number:#94a3b8;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);height:100vh;display:flex;flex-direction:column}
+  header{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+  header h1{font-size:15px;margin:0 12px 0 0;font-weight:600}
+  header h1 span{color:var(--mut);font-weight:400}
+  label.opt{display:flex;align-items:center;gap:5px;color:var(--mut)}
+  input[type=number]{width:60px;padding:3px 6px;border:1px solid var(--line);border-radius:6px}
+  button{padding:6px 14px;border:1px solid var(--line);border-radius:8px;background:var(--panel);cursor:pointer;font:inherit}
+  button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+  button:disabled{opacity:.5;cursor:default}
+  #status{color:var(--mut);margin-left:auto;white-space:nowrap}
+  #status.err{color:#dc2626}
+  main{flex:1;display:flex;min-height:0}
+  #left{flex:1.15;min-width:0;display:flex;flex-direction:column;border-right:1px solid var(--line)}
+  #right{flex:1;min-width:0;display:flex;flex-direction:column;background:var(--panel)}
+  #pagenav{display:flex;align-items:center;gap:10px;padding:6px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+  #pagenav .sp{margin-left:auto;display:flex;gap:10px;align-items:center;color:var(--mut)}
+  #canvaswrap{flex:1;overflow:auto;display:flex;justify-content:center;align-items:flex-start;padding:14px}
+  #pagebox{position:relative;box-shadow:0 1px 8px rgba(16,32,64,.14);background:#fff}
+  #pagebox canvas{display:block}
+  .det{position:absolute;border:1.5px solid;border-radius:2px;opacity:.55;cursor:pointer;transition:opacity .1s, box-shadow .1s}
+  .det:hover,.det.hl{opacity:1;box-shadow:0 0 0 3px var(--hl);z-index:2}
+  .det.hidden{display:none}
+  #blocks{flex:1;overflow:auto;padding:10px 14px}
+  .blk{padding:7px 10px;margin:0 0 8px;border:1px solid var(--line);border-left:4px solid var(--mut);border-radius:8px;cursor:pointer;background:var(--panel)}
+  .blk.hl{background:#fefce8;border-color:#eab308}
+  .blk .t{font-size:11px;letter-spacing:.4px;text-transform:uppercase;color:var(--mut);margin-bottom:2px;display:flex;gap:8px}
+  .blk .t .coords{margin-left:auto;letter-spacing:0;text-transform:none}
+  .blk .body{white-space:pre-wrap;word-break:break-word}
+  .blk .body:empty::after{content:"(no text — region only)";color:var(--mut);font-style:italic}
+  #raw{flex:1;overflow:auto;margin:0;padding:12px 14px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;display:none}
+  #hint{display:none;gap:10px;align-items:center;margin:10px 14px 0;padding:9px 12px;border:1px solid #f59e0b;background:#fffbeb;border-radius:8px;color:#92400e}
+  #hint button{border-color:#f59e0b}
+  #hint .go{background:#f59e0b;color:#fff;font-weight:600}
+  #hint .x{margin-left:auto;border:none;background:none;font-size:15px;color:#92400e}
+  #confchip{padding:2px 8px;border-radius:10px;font-size:12px;display:none}
+  #confchip.good{background:#dcfce7;color:#166534}
+  #confchip.warn{background:#fef9c3;color:#854d0e}
+  #confchip.bad{background:#fee2e2;color:#991b1b}
+  #drop{flex:1;display:flex;align-items:center;justify-content:center;color:var(--mut);flex-direction:column;gap:8px}
+  #drop.armed{outline:3px dashed var(--acc);outline-offset:-14px;color:var(--acc)}
+  .legend{display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--mut);justify-content:center;max-width:520px}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Unlimited OCR <span>· annotation viewer</span></h1>
+  <input type="file" id="file" accept="application/pdf">
+  <label class="opt"><input type="number" id="pages" min="1" placeholder="all">pages</label>
+  <label class="opt"><input type="checkbox" id="gundam">gundam (small text)</label>
+  <label class="opt" title="re-OCR low-confidence or looping pages in high-res automatically"><input type="checkbox" id="autohires" checked>auto hi-res</label>
+  <button class="primary" id="run" disabled>Annotate</button>
+  <span id="status">choose a PDF</span>
+</header>
+<main>
+  <section id="left">
+    <div id="pagenav">
+      <button id="prev">‹</button>
+      <span id="pageind">page –/–</span>
+      <button id="next">›</button>
+      <span id="confchip" title="mean top-1 token probability of this page's decode"></span>
+      <span class="sp">
+        <label class="opt"><input type="checkbox" id="showboxes" checked>boxes</label>
+        <span id="meta"></span>
+      </span>
+    </div>
+    <div id="canvaswrap">
+      <div id="drop">
+        <div style="font-size:34px">⇪</div>
+        <div>drop a PDF here (or use the picker above)</div>
+        <div class="legend" id="legend"></div>
+      </div>
+      <div id="pagebox" style="display:none"><canvas id="cv"></canvas><div id="overlay"></div></div>
+    </div>
+  </section>
+  <section id="right">
+    <div id="pagenav" style="border-bottom:1px solid var(--line)">
+      <b style="font-weight:600">Annotation</b>
+      <span class="sp"><label class="opt"><input type="checkbox" id="rawtoggle">raw</label></span>
+    </div>
+    <div id="hint"><span id="hintmsg"></span><button class="go" id="retrygundam">Retry with gundam</button><button class="x" id="hintclose" title="dismiss">✕</button></div>
+    <div id="blocks"><div style="color:var(--mut);padding:8px">Run an annotation to see extracted blocks here. Hover a block to highlight its region on the page (and vice versa).</div></div>
+    <pre id="raw"></pre>
+  </section>
+</main>
+<script type="module">
+import * as pdfjsLib from './pdf.mjs';
+pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.mjs';
+
+const $ = id => document.getElementById(id);
+const TYPES = ['text','title','header','image','image_caption','table','equation','list','ref_text','page_number'];
+$('legend').innerHTML = TYPES.map(t=>`<span><i style="background:var(--c-${t})"></i>${t}</span>`).join('');
+
+let pdf=null, fileBuf=null, fileName='', pageTexts=[], pageConf=[], pageLow=[], repSet=new Set(), cur=1, npages=0, rendering=false;
+const CONF_T=0.80, LOW_T=0.20;   // decode-confidence flags: mean p1 below / >20% of tokens with p1<0.5
+const AUTO_MAX=48;               // auto/manual hi-res retry batch cap (stays under the engine's GUNDAM_PAGE_CAP)
+
+// Per-page verdict combining the TWO failure modes (i is 0-based):
+//  - low token confidence  -> hesitant hallucination (garbled chars). Caught by conf.
+//  - repetition loop        -> CONFIDENT garbage (conf is ~high! e.g. a counting loop at 98%). Caught by degeneracy.
+// A page is bad if EITHER fires, so the chip never shows a reassuring % on a loop.
+function verdict(i){
+  const c=pageConf[i]||0, lf=pageLow[i]||0;
+  if(repSet.has(i+1)) return {bad:true, chip:'loop', why:'repeating pattern (degenerate loop) — token confidence stays high here'};
+  if(c>0 && (c<CONF_T || lf>LOW_T)) return {bad:true, chip:`conf ${Math.round(c*100)}%`, why:'low decode confidence'};
+  if(c>0) return {bad:false, chip:`conf ${Math.round(c*100)}%`, why:'decode confidence (mean top-1 token probability)'};
+  return {bad:false, chip:'', why:''};
+}
+function recomputeFlags(){ repSet = new Set(degeneratePages(pageTexts)); }
+
+function status(msg, err){ const s=$('status'); s.textContent=msg; s.className=err?'err':''; }
+
+function parsePages(rawText){
+  const parts = rawText.split('\f');   // server delimits pages with form-feed (aligns 1:1 with X-Page-Conf)
+  return parts.map(pg => {
+    const blocks = [];
+    const re = /<\|det\|>\s*([a-z_]+)\s*\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]<\|\/det\|>/g;
+    let m, prev = null;
+    while ((m = re.exec(pg))) {
+      if (prev) prev.text = pg.slice(prev.end, m.index).trim();
+      prev = { type: m[1], box: [+m[2], +m[3], +m[4], +m[5]], end: re.lastIndex, text: '' };
+      blocks.push(prev);
+    }
+    if (prev) prev.text = pg.slice(prev.end).trim();
+    return blocks;
+  });
+}
+
+async function renderPage(n){
+  if(!pdf || rendering) return; rendering = true;
+  try{
+    const page = await pdf.getPage(n);
+    const wrap = $('canvaswrap');
+    const avail = Math.max(320, wrap.clientWidth - 32);
+    const v1 = page.getViewport({scale:1});
+    const scale = Math.min(avail / v1.width, 1600 / v1.width);
+    const vp = page.getViewport({scale});
+    const dpr = window.devicePixelRatio || 1;
+    const cv = $('cv');
+    cv.width = Math.floor(vp.width*dpr); cv.height = Math.floor(vp.height*dpr);
+    cv.style.width = vp.width+'px'; cv.style.height = vp.height+'px';
+    const ctx = cv.getContext('2d');
+    await page.render({canvasContext:ctx, viewport:vp, transform: dpr!==1?[dpr,0,0,dpr,0,0]:null}).promise;
+    $('drop').style.display='none'; $('pagebox').style.display='block';
+    drawOverlay(vp.width, vp.height);
+    $('pageind').textContent = `page ${cur}/${npages}`;
+    const v = verdict(cur-1), chip = $('confchip');
+    if(v.chip){
+      chip.style.display='inline-block';
+      chip.className = v.bad?'bad':(pageConf[cur-1]>=0.9?'good':'warn');
+      chip.textContent = v.chip; chip.title = v.why;
+    } else chip.style.display='none';
+  } finally { rendering = false; }
+}
+
+function drawOverlay(w,h){
+  const ov = $('overlay'); ov.innerHTML='';
+  ov.style.cssText = `position:absolute;inset:0;width:${w}px;height:${h}px`;
+  const blocks = pageTexts[cur-1] || [];
+  const show = $('showboxes').checked;
+  blocks.forEach((b,i)=>{
+    const d = document.createElement('div');
+    d.className = 'det'+(show?'':' hidden');
+    d.dataset.i = i;
+    const [x0,y0,x1,y1] = b.box;
+    d.style.cssText += `;left:${x0/999*w}px;top:${y0/999*h}px;width:${(x1-x0)/999*w}px;height:${(y1-y0)/999*h}px;border-color:var(--c-${b.type},#888)`;
+    d.title = b.type;
+    d.onmouseenter = ()=>hl(i,true); d.onmouseleave = ()=>hl(i,false);
+    d.onclick = ()=>{ const el=$('blocks').querySelector(`[data-i="${i}"]`); el && el.scrollIntoView({block:'center',behavior:'smooth'}); flash(i); };
+    ov.appendChild(d);
+  });
+  renderBlocks(blocks);
+}
+
+function renderBlocks(blocks){
+  const c = $('blocks'); c.innerHTML='';
+  if(!blocks.length){ c.innerHTML = '<div style="color:var(--mut);padding:8px">(no blocks on this page)</div>'; return; }
+  blocks.forEach((b,i)=>{
+    const div = document.createElement('div');
+    div.className='blk'; div.dataset.i=i;
+    div.style.borderLeftColor = `var(--c-${b.type},#888)`;
+    const t = document.createElement('div'); t.className='t';
+    t.innerHTML = `<span>${b.type}</span><span class="coords">[${b.box.join(', ')}]</span>`;
+    const body = document.createElement('div'); body.className='body'; body.textContent = b.text;
+    div.append(t, body);
+    div.onmouseenter = ()=>hl(i,true); div.onmouseleave = ()=>hl(i,false);
+    div.onclick = ()=>flash(i);
+    c.appendChild(div);
+  });
+}
+
+function hl(i,on){
+  for(const el of document.querySelectorAll(`[data-i="${i}"]`)) el.classList.toggle('hl', on);
+}
+function flash(i){
+  hl(i,true); setTimeout(()=>hl(i,false), 1200);
+}
+
+async function loadPdf(buf, name){
+  fileBuf = buf; fileName = name;
+  pdf = await pdfjsLib.getDocument({data: buf.slice(0)}).promise;
+  npages = pdf.numPages; cur = 1; pageTexts = [];
+  $('run').disabled = false;
+  status(`${name} — ${npages} page(s), ready`);
+  renderPage(1);
+}
+
+// Degeneration detector: repetition-loop pages (e.g. an incrementing counter "EUV20 (2017/19)
+// ja EUV21 (2017/19) ...") evade exact no-repeat-ngram by design. Normalize digit runs, then
+// flag pages whose 8-word shingles are mostly duplicates. Legit prose/numbered lists score ~1.
+function degeneratePages(pages){
+  const bad=[];
+  pages.forEach((blocks,i)=>{
+    const txt = blocks.map(b=>b.text).join(' ');
+    if(txt.length < 3000) return;
+    const words = txt.replace(/\d+/g,'#').split(/\s+/).filter(Boolean);
+    if(words.length < 200) return;
+    const grams = new Set();
+    for(let j=0;j+8<=words.length;j++) grams.add(words.slice(j,j+8).join(' '));
+    if(grams.size/(words.length-7) < 0.35) bad.push(i+1);
+  });
+  return bad;
+}
+let flagged=[];
+function showHint(pages, why='repeating pattern'){
+  flagged = pages;
+  $('hintmsg').textContent = `page${pages.length>1?'s':''} ${pages.join(', ')}: ${why} — usually small print the base mode can't resolve.`;
+  const nretry = Math.min(pages.length, AUTO_MAX);
+  $('retrygundam').textContent = `Retry ${nretry} page${nretry>1?'s':''} with gundam`;
+  $('hint').style.display='flex';
+}
+function hideHint(){ $('hint').style.display='none'; }
+
+async function annotate(retryList){
+  if(!fileBuf) return;
+  const retry = Array.isArray(retryList) && retryList.length ? retryList : null;   // selective gundam re-run of flagged pages
+  const q = new URLSearchParams();
+  if(retry){ q.set('pages', retry.join(',')); q.set('gundam','1'); }
+  else{
+    const p = parseInt($('pages').value); if(p>=1) q.set('pages', p);
+    if($('gundam').checked) q.set('gundam','1');
+  }
+  $('run').disabled = true;
+  const t0 = performance.now();
+  status(retry?`retrying ${retry.length} page(s) with gundam… 0s`:'annotating… 0s');
+  const tick = setInterval(()=>status(`${retry?'retrying':'annotating'}… ${((performance.now()-t0)/1000).toFixed(0)}s`), 500);
+  try{
+    const r = await fetch('/ocr?'+q, {method:'POST', body: new Blob([fileBuf])});
+    const text = await r.text();
+    clearInterval(tick);
+    if(!r.ok){ status(`error ${r.status}: ${text.trim()}`, true); return; }
+    const pp = parsePages(text);
+    const pc = (r.headers.get('X-Page-Conf')||'').split(',').map(parseFloat);
+    const pl = (r.headers.get('X-Page-LowConf')||'').split(',').map(parseFloat);
+    const secs = ((performance.now()-t0)/1000).toFixed(1);
+    if(retry){
+      retry.forEach((pgno,k)=>{                                    // merge retried pages into the current result
+        if(pp[k]) pageTexts[pgno-1]=pp[k];
+        if(!isNaN(pc[k])) pageConf[pgno-1]=pc[k];
+        if(!isNaN(pl[k])) pageLow[pgno-1]=pl[k];
+      });
+      recomputeFlags();                                            // retried loop pages drop out of repSet -> chips go green
+      hideHint();
+      const stillBad = retry.filter(pgno=>verdict(pgno-1).bad);    // gundam is the last resort — don't offer another retry
+      status(stillBad.length
+        ? `retried ${retry.length} page(s) with gundam; ${stillBad.length} still low quality (page ${stillBad.join(', ')})`
+        : `auto hi-res resolved ${retry.length} page(s) in ${secs}s`);
+    }else{
+      pageTexts = pp;
+      pageConf = pc.filter(x=>!isNaN(x)); pageLow = pl.filter(x=>!isNaN(x));
+      $('raw').textContent = text;
+      $('meta').textContent = `${r.headers.get('X-Tokens')||'?'} tokens · ${secs}s`;
+      status(`done: ${r.headers.get('X-Pages')||pageTexts.length} page(s) annotated in ${secs}s`);
+      cur = Math.min(cur, Math.max(1,pageTexts.length));
+      recomputeFlags();
+      hideHint();
+      if(!$('gundam').checked){
+        const bad = pageTexts.map((_,i)=>verdict(i).bad?i+1:0).filter(Boolean);
+        if(bad.length){
+          const anyLoop = bad.some(p=>repSet.has(p));
+          if($('autohires').checked && bad.length<=AUTO_MAX){ renderPage(cur); return annotate(bad); }  // auto-switch flagged pages to high-res
+          const why = bad.length>AUTO_MAX ? `${bad.length} low-quality pages (too many to auto-retry)` : (anyLoop?'repeating pattern (loop)':'low decode confidence');
+          showHint(bad, why);
+        }
+      }
+    }
+    renderPage(cur);
+  }catch(e){
+    clearInterval(tick); status('request failed: '+e.message, true);
+  }finally{
+    $('run').disabled = false;
+  }
+}
+
+$('file').onchange = async e => {
+  const f = e.target.files[0]; if(!f) return;
+  loadPdf(await f.arrayBuffer(), f.name);
+};
+const cw = document.getElementById('canvaswrap');
+for(const [ev,on] of [['dragover',true],['dragleave',false]])
+  cw.addEventListener(ev, e=>{ e.preventDefault(); $('drop').classList.toggle('armed',on); });
+cw.addEventListener('drop', async e=>{
+  e.preventDefault(); $('drop').classList.remove('armed');
+  const f = e.dataTransfer.files[0];
+  if(f && /pdf$/i.test(f.name)) loadPdf(await f.arrayBuffer(), f.name);
+});
+$('run').onclick = annotate;
+$('retrygundam').onclick = ()=>{ hideHint(); annotate(flagged.slice(0,AUTO_MAX)); };   // surgical: only the flagged pages (capped), merged back
+$('hintclose').onclick = hideHint;
+$('prev').onclick = ()=>{ if(cur>1){cur--; renderPage(cur);} };
+$('next').onclick = ()=>{ if(cur<npages){cur++; renderPage(cur);} };
+$('showboxes').onchange = ()=>{ for(const el of document.querySelectorAll('.det')) el.classList.toggle('hidden', !$('showboxes').checked); };
+$('rawtoggle').onchange = ()=>{ const raw=$('rawtoggle').checked; $('raw').style.display=raw?'block':'none'; $('blocks').style.display=raw?'none':'block'; };
+window.addEventListener('resize', ()=>{ if(pdf) renderPage(cur); });
+document.addEventListener('keydown', e=>{
+  if(e.target.tagName==='INPUT') return;
+  if(e.key==='ArrowLeft') $('prev').click();
+  if(e.key==='ArrowRight') $('next').click();
+});
+Object.assign(window,{degeneratePages,showHint,pageBlocks:()=>pageTexts,flaggedPages:()=>flagged,confs:()=>pageConf});  // console/test hooks
+</script>
+</body>
+</html>

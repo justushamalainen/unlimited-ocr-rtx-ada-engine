@@ -33,6 +33,11 @@ curl --data-binary @doc.pdf 'http://host:8000/ocr?gundam=1'        # high-res ti
 curl 'http://host:8000/healthz'                                    # liveness + X-Queue/X-Done headers
 ```
 
+`GET /` serves a built-in **annotation viewer** (`web/index.html`): drop a PDF, hit Annotate,
+and browse pages with the rendered page on the left (det boxes overlaid, color-coded by block
+type) and the extracted blocks on the right — hovering either side highlights the other.
+The browser renders the PDF locally (bundled pdf.js); only the annotation request hits the GPU.
+
 Responses carry `X-Pages`/`X-Tokens`/`X-Truncated-Pages`/`X-Millis`. Errors: 400 bad request,
 411 missing Content-Length, 413 too large / gundam page cap, 422 unreadable PDF, 501 chunked
 body, 503 queue full (16 jobs) or connection cap (64). One request per connection; send

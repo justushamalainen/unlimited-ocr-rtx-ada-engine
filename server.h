@@ -13,11 +13,14 @@ struct OcrJob{
     // request (connection thread, immutable after enqueue)
     std::string path;                 // spooled PDF (unlinked by the connection thread after completion)
     int npages=-1;                    // page cap; -1 = all
+    std::vector<int> pagelist;        // explicit 0-based pages (?pages=3,7,12 — selective retry); empty = first npages
     bool gundam=false;                // high-res tiling (exclusive run; base jobs co-batch)
     std::chrono::steady_clock::time_point t_enq;
     // result (engine thread, before srv_complete)
     int status=200; std::string err;  // 200 | 413 gundam page cap | 422 unreadable/render-failed
     std::vector<std::vector<int>> page_toks;  // per page, raw token ids (EOS included; decode via ocr_decode_tokens)
+    std::vector<float> page_conf;     // per page: mean top-1 prob of emitted tokens (decode confidence)
+    std::vector<float> page_lowfrac;  // per page: fraction of tokens with p1<0.5
     int pages=0; int pending=0;       // pending = pages not yet finished (engine-internal)
     long tokens=0; int truncated=0;   // emitted (non-EOS) tokens; pages cut at MAXSTEP without EOS
     // completion handshake
@@ -30,6 +33,6 @@ std::shared_ptr<OcrJob> srv_take_gundam();   // pop head job if gundam; null oth
 bool srv_wait_work();                        // block until a job is queued; true = head is base, false = head is gundam
 void srv_complete(std::shared_ptr<OcrJob> j);// publish result + wake the waiting connection thread
 // server lifecycle (main)
-int  server_start(int port);                 // spool dir + listen + accept thread; returns bound port (0 = ephemeral ok)
+int  server_start(int port,const char* bind_addr=nullptr);  // spool+listen+accept thread; returns bound port (0 = ephemeral ok); bind_addr default 0.0.0.0
 // engine.cu exports for connection threads (read-only global vocab -> thread-safe after load_vocab)
 std::string ocr_decode_tokens(const std::vector<int>& toks);   // BPE-decode, skipping EOS(id 1)
