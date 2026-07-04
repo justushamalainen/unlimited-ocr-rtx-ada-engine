@@ -570,3 +570,50 @@ renders pages offline); engine = 1 POST/doc to `ocr_bin serve` (renders internal
   -> empirically confirms the engine's precision placement (int4 experts + exact-rescore lm_head ONLY;
   attention stays fp8/bf16). Structural gap: vLLM's floor is bf16 MoE decode + FlexAttention R-SWA
   (~10x cudagraph tax documented upstream); fleet clients: ../vllm_fleet.py, ../engine_fleet.py.
+
+## Heterogeneous decode windows: base + gundam co-batch, interludes deleted (2026-07-03)
+One decode window now holds page-streams of DIFFERENT reference sizes (base 273 refs + every gundam
+tiling at once), each slot starting/stepping/retiring independently — the endpoint of next_steps.md.
+The enabler: only `k_rope_store_b`/`k_attn_split_b` read the reference KV, so the scalar `pf`/stride
+became per-slot device arrays; nothing else was coupled.
+- **Layout (per user direction)**: per layer ONE KV allocation with two zones — W fixed base-sized slot
+  regions (`MS=PF+WIN` rows) + G "big" regions (`MSG=3798+WIN` rows, sized for the largest 32-tile
+  gundam ref, GVPP_MAX=3793). A constant per-slot row-offset table `d_kvoff[]` and per-slot ref length
+  `d_pf[]` replace the scalar `pf`/`maxseq` kernel args — a single in-place integer array-load swap in
+  the two bit-sensitive kernels (FP expression shape kept; ptxas moved integer scheduling only, all
+  gates bit-exact). G from free VRAM, capped by `GSLOTS` (default 32, capacity knob like WINDOW); big
+  slots exist only when the source can yield oversize refs (`PageSrc::vpp_gmax()>0` = server) — CLI
+  allocs are byte-identical to before.
+- **No head-of-line blocking, by construction**: base pages only take base slots, gundam pages only big
+  slots — admission classes never wait on each other (`next(base_ok,big_ok)` masks + per-class free
+  lists). Gundam interludes/drains DELETED (server.cpp: srv_take_gundam/reenqueue_front gone; one
+  continuous `generate_pagepar_core` call). Auto hi-res re-pass = flagged pages re-queued as gundam
+  ITEMS into the same rotation (merge = done() writing page_toks[i] directly).
+- **Admission pacing + booster**: a gundam admission costs ~470ms (encode+prefill) serial on the engine
+  thread vs ~40ms base, so big admissions are capped at 2/boundary (spread, decode keeps stepping), and
+  when BOTH classes are active a base-only sub-window (+48 steps, own small ns/graph) runs per boundary:
+  base steps are ~10x cheaper than big-slot admission stalls, so latency-class pages aren't rate-limited
+  by batch-class admission. Measured: idle 1pg base 0.8s; same page DURING a 50pg gundam job 7.3-8.2s
+  (was: waited for the whole job, 35s+); gundam job e2e unchanged (35-38s).
+- **Per-slot ns (the agreement fix)**: sizing key-splits to the window max (PF_gmax -> ns=32) changed
+  base streams' softmax reduction shape in mixed windows and amplified near-tie cascade (idle-vs-loaded
+  agreement 0.93 on a TOC page). `k_attn_split_b` now derives its split count per slot from `pf[act[s]]`
+  (launch grid stays at the window max; padding splits write NEUTRAL, and the merge tree is fixed 128-wide
+  with exact +0.0f padding -> bit-equal to an nss-split launch). Uniform windows: nss==ns exactly ->
+  gates unaffected. Agreement recovered to 0.9987 (base multi-doc class). Also removes the wasted-split
+  perf concern for small-ref slots.
+- **Mixed-tiling gundam docs**: `ocr_gundam` sequential fallback deleted — a doc with per-page tilings
+  runs as ONE windowed pass (slots sized to the doc max, per-slot pf), byte-identical across runs
+  (positions are pure functions of the page — the heterogeneity invariant, verified on a 3-tiling doc).
+- **Graphs**: step-graphs cached per (NA, ns) — pf/kvoff are runtime device arrays, so no per-shape
+  graph explosion; captured grid z = window-max ns.
+- **Contract**: mixed-window co-batching = the SAME accepted near-tie class as base multi-doc (agreement
+  gate >=0.99 in servercheck, "heterogeneous window" stanza); idle single-job byte-parity gates unchanged
+  and passing (base + gundam). Gates: 3 md5 BIT-EXACT, gundam-50 BIT-IDENTICAL, make check/lint/servercheck
+  PASS; sanitizers: base 4x clean, mixed-tiling memcheck+initcheck+synccheck clean (racecheck cannot run
+  gundam-sized prefills — host shadow memory hits ~126GB and the kernel OOM-kills the box; pre-existing
+  tool limit, 0 hazards before abort; sanitize.sh now ulimit-guards all tools, ULIM env). Perf: NO
+  regression — 112pg base 18.3k tok/s / TTFT 356ms / 12.4s e2e, gundam-50 34.4s.
+- **Next lever (documented, not built)**: async admission — overlap gundam encode (VS stream, launch/sync
+  already split) and prefill (needs a second scratch set + cuBLAS handle, or global-swap trick) with
+  decode; would cut the remaining ~470ms/page boundary stalls and the base-under-gundam gap (8s -> ~3-4s).

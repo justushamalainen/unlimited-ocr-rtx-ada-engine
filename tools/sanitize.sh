@@ -16,11 +16,16 @@ ARGS=("$PDF" 1 "$TOKENS")
 [ -x "$BIN" ] || { echo "build first:  make KV=fp8"; exit 1; }
 command -v "$CS" >/dev/null || { echo "compute-sanitizer not found at $CS"; exit 1; }
 
+# HARD LIMIT (learned 2026-07-03 the OOM way): racecheck's host shadow memory explodes on gundam-sized
+# prefills (>900-tok refs) — 126GB RSS, kernel OOM-killed the whole box (twice: 07-02 + 07-03). The ulimit
+# makes it abort with bad_alloc instead. racecheck under GUNDAM=1 is expected to die at the limit (0 hazards
+# up to that point); gundam/mixed coverage = memcheck+initcheck+synccheck (these fit) + base racecheck.
+ULIM="${ULIM:-62914560}"   # kB of virtual memory (60GB), env-overridable
 fail=0
 for tool in memcheck racecheck initcheck synccheck; do
   echo "==================== compute-sanitizer --tool $tool ${GUNDAM:+(GUNDAM)} ===================="
   log="/tmp/cs_${tool}.log"
-  if "$CS" --tool "$tool" --error-exitcode 99 "$BIN" "${ARGS[@]}" >"$log" 2>&1; then
+  if ( ulimit -v "$ULIM"; exec "$CS" --tool "$tool" --error-exitcode 99 "$BIN" "${ARGS[@]}" ) >"$log" 2>&1; then
     echo "  PASS ($tool) — no errors"
   else
     echo "  FAIL ($tool) — see $log"

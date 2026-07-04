@@ -34,24 +34,15 @@ static std::mutex g_qm; static std::condition_variable g_qcv;
 static std::atomic<long> g_done{0},g_failed{0};
 static std::string g_spool;
 
-std::shared_ptr<OcrJob> srv_take_base(){
+std::shared_ptr<OcrJob> srv_take(){
     std::lock_guard<std::mutex> lk(g_qm);
-    if(g_q.empty()||g_q.front()->gundam) return nullptr;
-    auto j=g_q.front(); g_q.pop_front(); return j;
-}
-std::shared_ptr<OcrJob> srv_take_gundam(){
-    std::lock_guard<std::mutex> lk(g_qm);
-    if(g_q.empty()||!g_q.front()->gundam) return nullptr;
+    if(g_q.empty()) return nullptr;
     auto j=g_q.front(); g_q.pop_front(); return j;
 }
 bool srv_wait_work(){
     std::unique_lock<std::mutex> lk(g_qm);
     g_qcv.wait(lk,[]{return !g_q.empty();});
-    return !g_q.front()->gundam;
-}
-void srv_reenqueue_front(std::shared_ptr<OcrJob> j){   // engine thread: auto-hires re-pass jumps ahead of new base work
-    { std::lock_guard<std::mutex> lk(g_qm); g_q.push_front(j); }
-    g_qcv.notify_one();
+    return true;                                       // base and gundam jobs feed the same heterogeneous window
 }
 void srv_complete(std::shared_ptr<OcrJob> j){
     double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-j->t_enq).count();

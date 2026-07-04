@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Server regression gate: parity with the CLI (idle server == CLI bytes), multi-doc concurrency,
-# gundam interlude + re-entry, and error paths. Run after touching engine.cu/server.cpp/vision_enc.cu:
+# heterogeneous windows (base+gundam co-batch: agreement, no head-of-line blocking, mixed tilings),
+# and error paths. Run after touching engine.cu/server.cpp/vision_enc.cu:
 #   make servercheck        (builds KV=fp8 first, same config as tools/check.sh)
 # Needs the GPU + weights; takes ~1-2 min (one weight load, one server process).
 set -uo pipefail
@@ -32,9 +33,9 @@ curl -sS --data-binary @"$PDF" "$U/ocr?pages=1&gundam=1" -o $T/srvg.txt || fail 
 GUNDAM=1 ./ocr_bin "$PDF" 1 60 2>/dev/null | sed -n '/===== OCR/,$p' | tail -n +2 > $T/clig.txt
 { cat $T/srvg.txt; echo; } | diff - $T/clig.txt >/dev/null && echo "  OK" || fail "gundam parity"
 
-echo "== base re-entry after gundam interlude =="
+echo "== base parity preserved after a gundam job ran (vision-input invalidation) =="
 curl -sS --data-binary @"$PDF" "$U/ocr?pages=1" -o $T/srv2.txt
-{ cat $T/srv2.txt; echo; } | diff - $T/cli.txt >/dev/null && echo "  OK" || fail "re-entry parity"
+{ cat $T/srv2.txt; echo; } | diff - $T/cli.txt >/dev/null && echo "  OK" || fail "post-gundam parity"
 
 echo "== concurrent documents (3 in flight, one arrives late) =="
 curl -sS --data-binary @"$PDF" "$U/ocr?pages=4" -o /dev/null -w '%{http_code}\n' > $T/r1 & P1=$!
@@ -79,6 +80,39 @@ if [ -f "$BIG" ]; then   # paper_x8 = 112 pages; gundam-decode 68 (over the remo
   grep -q "X-Pages: 68" $T/gwin.h || fail "gundam 68pg X-Pages"
   [ $rc -eq 0 ] && echo "  OK (68 gundam pages, no cap)"
 else echo "  SKIP (no paper_x8.pdf)"; fi
+
+echo "== heterogeneous window: base + gundam co-batch (agreement vs idle, both 200) =="
+if [ -f "$BROCH" ]; then
+  curl -sS --max-time 120 --data-binary @"$PDF" "$U/ocr?pages=1&auto=0" -o $T/het_idle.txt || fail "idle ref POST"
+  curl -sS --max-time 300 --data-binary @"$BROCH" "$U/ocr?pages=8&gundam=1" -o /dev/null -w '%{http_code}' > $T/het_g & PG=$!
+  sleep 1
+  curl -sS --max-time 300 --data-binary @"$PDF" "$U/ocr?pages=1&auto=0" -o $T/het_base.txt -w '%{http_code}' > $T/het_b
+  wait $PG
+  [ "$(cat $T/het_b)$(cat $T/het_g)" = 200200 ] || fail "co-batch statuses: base=$(cat $T/het_b) gundam=$(cat $T/het_g)"
+  ag=$(python3 -c "import difflib;a=open('$T/het_idle.txt').read();b=open('$T/het_base.txt').read();print(f'{difflib.SequenceMatcher(None,a,b).ratio():.4f}')")
+  echo "  base agreement idle-vs-co-batched: $ag"
+  awk "BEGIN{exit !($ag>=0.99)}" && echo "  OK (>=0.99 agreement, near-tie class)" || fail "co-batch agreement $ag < 0.99"
+else echo "  SKIP (no reaktor_mkt.pdf)"; fi
+
+echo "== no head-of-line blocking: 1pg base during 50pg gundam finishes early =="
+if [ -f "$BROCH" ]; then
+  curl -sS --max-time 600 --data-binary @"$BROCH" "$U/ocr?gundam=1" -o /dev/null -w '%{time_total}' > $T/hol_g & PG=$!
+  sleep 2
+  bt=$(curl -sS --max-time 600 --data-binary @"$PDF" "$U/ocr?pages=1" -o /dev/null -w '%{time_total}')
+  wait $PG; gt=$(cat $T/hol_g)
+  echo "  base 1pg: ${bt}s while gundam 50pg ran ${gt}s"
+  awk "BEGIN{exit !($bt < 15 && $bt+2 < $gt)}" && echo "  OK (base returned well before the gundam job)" || fail "base 1pg took ${bt}s during gundam job (${gt}s) — HOL blocking?"
+else echo "  SKIP (no reaktor_mkt.pdf)"; fi
+
+echo "== mixed-tiling gundam doc decodes in one heterogeneous pass =="
+MIX="$HOME/unlimited-ocr/testdata/mixed_ratio.pdf"   # 3 pages, 3 different gundam tilings (was: sequential fallback)
+if [ -f "$MIX" ]; then
+  code=$(curl -sS --max-time 120 --data-binary @"$MIX" "$U/ocr?gundam=1" -o $T/mix.txt -D $T/mix.h -w '%{http_code}')
+  [ "$code" = 200 ] || fail "mixed-tiling gundam -> $code"
+  grep -q "X-Pages: 3" $T/mix.h || fail "mixed-tiling X-Pages"
+  [ $(wc -c < $T/mix.txt) -gt 1000 ] || fail "mixed-tiling output suspiciously small"
+  [ $rc -eq 0 ] && echo "  OK (3 tilings, one job)"
+else echo "  SKIP (no mixed_ratio.pdf)"; fi
 
 echo "== annotation viewer statics =="
 curl -sS $U/ | grep -q "annotation viewer" || fail "GET / viewer html"
