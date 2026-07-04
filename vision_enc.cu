@@ -612,9 +612,24 @@ static bool gundam_render(const char* pdf,int page){
     fz_drop_pixmap(ctx,pix); fz_drop_page(ctx,pg);                                    // safe: pageable-src cudaMemcpyAsync returns only after staging
     return true;
 }
-int gundam_encode(const char* pdf,int page){                                          // PDF page -> g_gundam [ntok,1280]; -1 = render failed
+// Async split (heterogeneous-window admission): begin() launches render+SAM/CLIP/assemble on VS and
+// records a completion event — the engine keeps replaying decode graphs on its own stream meanwhile.
+// g_gundam stays valid until the NEXT begin(). ready() polls; wait() blocks (idle windows).
+static cudaEvent_t g_gev=nullptr;
+int gundam_encode_begin(const char* pdf,int page){                                    // ntok, or -1 = render failed
     init_vision(); if(!render_preprocess(pdf,page,120.f))return -1; if(!gundam_render(pdf,page))return -1;
-    int nt=gundam_assemble(g_dimg,g_tilesf,g_gw,g_gh,g_gP); CK(cudaStreamSynchronize(VS)); return nt;
+    int nt=gundam_assemble(g_dimg,g_tilesf,g_gw,g_gh,g_gP);
+    if(!g_gev) CK(cudaEventCreateWithFlags(&g_gev,cudaEventDisableTiming));
+    CK(cudaEventRecord(g_gev,VS)); return nt;
+}
+int gundam_encode_ready(){                                                            // 1 = the in-flight encode finished on VS
+    cudaError_t qs=cudaEventQuery(g_gev);                                             // (own name: vision CK() declares a local `e`)
+    if(qs==cudaErrorNotReady){ (void)cudaGetLastError(); return 0; }
+    CK(qs); return 1;                                                                 // success -> ready; any other error fails fast
+}
+void gundam_encode_wait(){ CK(cudaEventSynchronize(g_gev)); }
+int gundam_encode(const char* pdf,int page){                                          // sync wrapper (CLI path): PDF page -> g_gundam [ntok,1280]; -1 = render failed
+    int nt=gundam_encode_begin(pdf,page); if(nt<0) return nt; gundam_encode_wait(); return nt;
 }
 int gundam_page_ntok(const char* pdf,int page){                                       // token count from page dims ONLY (no encode); -1 = unreadable
     fz_context* ctx=fzctx(); fz_document* doc=fzdoc(pdf); if(!doc)return -1;

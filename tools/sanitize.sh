@@ -20,7 +20,8 @@ command -v "$CS" >/dev/null || { echo "compute-sanitizer not found at $CS"; exit
 # prefills (>900-tok refs) — 126GB RSS, kernel OOM-killed the whole box (twice: 07-02 + 07-03). The ulimit
 # makes it abort with bad_alloc instead. racecheck under GUNDAM=1 is expected to die at the limit (0 hazards
 # up to that point); gundam/mixed coverage = memcheck+initcheck+synccheck (these fit) + base racecheck.
-ULIM="${ULIM:-62914560}"   # kB of virtual memory (60GB), env-overridable
+# Base racecheck itself peaks 60-100GB host — 100GB default fits it while still protecting a 125GB box.
+ULIM="${ULIM:-104857600}"  # kB of virtual memory (100GB), env-overridable
 fail=0
 for tool in memcheck racecheck initcheck synccheck; do
   echo "==================== compute-sanitizer --tool $tool ${GUNDAM:+(GUNDAM)} ===================="

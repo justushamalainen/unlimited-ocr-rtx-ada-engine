@@ -614,6 +614,36 @@ became per-slot device arrays; nothing else was coupled.
   gundam-sized prefills — host shadow memory hits ~126GB and the kernel OOM-kills the box; pre-existing
   tool limit, 0 hazards before abort; sanitize.sh now ulimit-guards all tools, ULIM env). Perf: NO
   regression — 112pg base 18.3k tok/s / TTFT 356ms / 12.4s e2e, gundam-50 34.4s.
-- **Next lever (documented, not built)**: async admission — overlap gundam encode (VS stream, launch/sync
-  already split) and prefill (needs a second scratch set + cuBLAS handle, or global-swap trick) with
-  decode; would cut the remaining ~470ms/page boundary stalls and the base-under-gundam gap (8s -> ~3-4s).
+- ~~Next lever: async admission~~ — BUILT, see next section.
+
+## Async big-ref admission: encode+prefill overlap decode (2026-07-04)
+The ~470ms/page gundam admission (encode+prefill, serial on the engine thread between windows) was the
+last latency tax on co-batched streams. Now it overlaps the decode window — still ONE engine thread:
+- **Pipeline**: `gundam_encode_begin()` launches render+SAM/CLIP/assemble on VS and records an event
+  (vision_enc.cu); the core's `pump()` runs right AFTER the 16-step window's graphs are queued on GS —
+  the encode's CPU render (~150ms MuPDF) and GPU work run while GS replays. At the next boundary the
+  finished encode's prefill runs on a dedicated admission stream, and the slot joins via `ready[]`/
+  `activate()`. Depth 1 (vision buffers are single-instance; result parked until consumed).
+- **PfCtx pointer-swap (the trick)**: prefill/mlp_block/moe_grouped read file-scope scratch globals; a
+  second full context (scratch + gm pools + kcache/vcache + non-blocking stream + own cuBLAS handle +
+  32MB workspace, ~720MB at PFG) is POINTER-SWAPPED in around the admission prefill only. Verified code
+  untouched; decode graphs hold pointers captured at graph time, so swaps between windows can't perturb
+  them. Prefill on the second handle/stream is BIT-IDENTICAL (idle gundam parity stanza passes byte-exact).
+- **Legacy-stream gotcha (the enabler)**: any plain `cudaMemcpy` uses the LEGACY default stream and
+  synchronizes with ALL blocking streams — one stray sync memcpy at a boundary would drain the in-flight
+  VS encode and kill the overlap. All loop/retire/admit/moe_grouped copies are now `cudaMemcpyAsync` on
+  GS (+ stream-scoped sync where the host reads). Base admission stays synchronous on GS (it defines the
+  idle-parity NA trajectory); with an encode in flight its vis_gpu_sync can wait <=~200ms (bounded, rare).
+- **Deadlock fixed en route**: with big admissions no longer in `admit()`, an idle boundary whose only
+  pending work was gundam items (e.g. the auto-hires re-pass) would block in `srv_wait_work()` — the
+  items live in the source rotation, not the HTTP queue. The NA==0 path now pumps/activates BEFORE
+  deciding to block. Also fixed: the pump must stage the encoded ref at ROW 1 of the embeds buffer
+  (slot-local convention) — passing `gundam_result()` directly shifted every visual token by one row;
+  decode still "worked" (conf 0.92!) and only the byte-parity gate caught it.
+- **Measured**: base 1pg DURING a 50pg gundam job **2.3s** at GSLOTS=8 / **4.5s** at GSLOTS=32 (was 8.2s
+  with serial capped admission, 15.7s uncapped, 35s+ behind the old interlude; idle 0.8s). Gundam-50 e2e
+  36.6s (no regression). 112pg base 18,306 tok/s / TTFT 346ms / 12.2s — untouched. servercheck runs its
+  test server at GSLOTS=8 (GSLOTS_CHECK env): the gate spawns server+CLI on one GPU, often next to a
+  production instance, and the default 32 big slots (+3.7GB/server) can OOM the CLI comparison run.
+- **Gates**: 3 md5 BIT-EXACT, gundam-50 BIT-IDENTICAL, check/lint/servercheck PASS (idle gundam parity =
+  byte-exact THROUGH the async pump), sanitizers clean (racecheck: gundam-size infeasible, see above).

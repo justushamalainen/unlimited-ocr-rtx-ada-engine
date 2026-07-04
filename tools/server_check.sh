@@ -11,7 +11,10 @@ T=$(mktemp -d); trap 'kill $SPID 2>/dev/null; rm -rf $T' EXIT
 rc=0
 fail(){ echo "  FAIL: $1"; rc=1; }
 
-./ocr_bin serve 0 > $T/serve.log 2>&1 & SPID=$!
+# GSLOTS=8 for the TEST server: the gate spawns server + CLI-comparison runs on one GPU (often next to a
+# production instance); the default 32 big slots (+3.7GB/server) can OOM the CLI run -> empty-file "parity
+# failures". 8 slots exercise the same heterogeneous-window code paths at CI footprint.
+GSLOTS="${GSLOTS_CHECK:-8}" ./ocr_bin serve 0 > $T/serve.log 2>&1 & SPID=$!
 for i in $(seq 120); do
   PORT=$(grep -oE 'ready on port [0-9]+' $T/serve.log | grep -oE '[0-9]+$' || true); [ -n "$PORT" ] && break
   kill -0 $SPID 2>/dev/null || { echo "server died:"; tail -5 $T/serve.log; exit 1; }

@@ -382,7 +382,7 @@ static void moe_grouped(Layer& ly,int S){
     CK(cudaMemsetAsync(gm_cnt,0,NEXP*4,GS));
     k_moe_hist<<<(tot+255)/256,256,0,GS>>>(didx,gm_cnt,S);
     CK(cudaStreamSynchronize(GS));                                              // hist runs on GS; must finish before host reads counts
-    static int hcnt[NEXP],hoff[NEXP+1]; CK(cudaMemcpy(hcnt,gm_cnt,NEXP*4,cudaMemcpyDeviceToHost));
+    static int hcnt[NEXP],hoff[NEXP+1]; CK(cudaMemcpyAsync(hcnt,gm_cnt,NEXP*4,cudaMemcpyDeviceToHost,GS)); CK(cudaStreamSynchronize(GS)); // stream-scoped: a legacy-stream memcpy would drain the OTHER streams (async-admission overlap)
     hoff[0]=0; for(int e=0;e<NEXP;e++)hoff[e+1]=hoff[e]+hcnt[e]; const int* off=hoff;
     CK(cudaMemcpyAsync(gm_off,hoff,(NEXP+1)*4,cudaMemcpyHostToDevice,GS)); CK(cudaMemsetAsync(gm_cur,0,NEXP*4,GS));
     k_moe_scat<<<(tot+255)/256,256,0,GS>>>(didx,gm_off,gm_cur,gm_gtok,S);
@@ -410,6 +410,46 @@ static void mlp_dense(Layer&ly,const bf16* xn,bf16* outY,int S,int interm,bf16* 
     lin(xn,Wg,mg,S,H,interm); lin(xn,Wu,mu,S,H,interm);
     k_silu_mul<<<(S*interm+255)/256,256,0,GS>>>(mg,mu,mh,S*interm);
     lin(mh,Wd,outY,S,interm,H);
+}
+// ===== async-admission prefill context (heterogeneous windows) =====
+// Big-ref (gundam) admissions prefill on their OWN stream + scratch + cuBLAS handle so decode keeps
+// replaying on GS. Single engine thread: the file-scope scratch globals are pointer-SWAPPED around the
+// admission prefill only — the verified prefill/mlp_block/moe_grouped code is untouched, and decode
+// graphs hold pointers captured at graph time, so swaps between windows cannot perturb them.
+struct PfCtx{
+    bf16 *xbuf,*nbuf,*q,*k,*v,*att,*tmp,*mg,*mu,*mh; float* glog; int* didx; float *dw,*Yf;
+    kvt *kcache[NL],*vcache[NL];
+    bf16 *gm_xg,*gm_gate,*gm_up,*gm_h,*gm_og; int *gm_gtok,*gm_inv; long gm_cap; int *gm_cnt,*gm_off,*gm_cur;
+    cudaStream_t st; cublasHandle_t cub; void* ws;
+};
+static void pfctx_alloc(PfCtx& c,int S){
+    size_t sH=(size_t)S*H;
+    CK(cudaMalloc(&c.xbuf,sH*2));CK(cudaMalloc(&c.nbuf,sH*2));CK(cudaMalloc(&c.q,sH*2));CK(cudaMalloc(&c.k,sH*2));CK(cudaMalloc(&c.v,sH*2));CK(cudaMalloc(&c.att,sH*2));CK(cudaMalloc(&c.tmp,sH*2));
+    CK(cudaMalloc(&c.mg,(size_t)S*DENSEI*2));CK(cudaMalloc(&c.mu,(size_t)S*DENSEI*2));CK(cudaMalloc(&c.mh,(size_t)S*DENSEI*2));
+    CK(cudaMalloc(&c.glog,(size_t)S*NEXP*4));CK(cudaMalloc(&c.didx,(size_t)S*TOPK*4));CK(cudaMalloc(&c.dw,(size_t)S*TOPK*4));CK(cudaMalloc(&c.Yf,sH*4));
+    for(int l=0;l<NL;l++){ CK(cudaMalloc(&c.kcache[l],(size_t)S*H*sizeof(kvt))); CK(cudaMalloc(&c.vcache[l],(size_t)S*H*sizeof(kvt))); }
+    long tot=(long)S*TOPK; c.gm_cap=tot;                     // gm pools preallocated at PFG size -> no lazy growth in the swapped context
+    CK(cudaMalloc(&c.gm_xg,(size_t)tot*H*2));CK(cudaMalloc(&c.gm_gate,(size_t)tot*MOEI*2));CK(cudaMalloc(&c.gm_up,(size_t)tot*MOEI*2));
+    CK(cudaMalloc(&c.gm_h,(size_t)tot*MOEI*2));CK(cudaMalloc(&c.gm_og,(size_t)tot*H*2));CK(cudaMalloc(&c.gm_gtok,(size_t)tot*4));CK(cudaMalloc(&c.gm_inv,(size_t)tot*4));
+    CK(cudaMalloc(&c.gm_cnt,NEXP*4));CK(cudaMalloc(&c.gm_off,(NEXP+1)*4));CK(cudaMalloc(&c.gm_cur,NEXP*4));
+    CK(cudaStreamCreateWithFlags(&c.st,cudaStreamNonBlocking));
+    CB(cublasCreate(&c.cub)); CB(cublasSetStream(c.cub,c.st)); CK(cudaMalloc(&c.ws,(size_t)32<<20)); CB(cublasSetWorkspace(c.cub,c.ws,(size_t)32<<20));
+}
+static void pfctx_swap(PfCtx& c){
+    std::swap(xbuf,c.xbuf);std::swap(nbuf,c.nbuf);std::swap(q,c.q);std::swap(k,c.k);std::swap(v,c.v);std::swap(att,c.att);std::swap(tmp,c.tmp);
+    std::swap(mg,c.mg);std::swap(mu,c.mu);std::swap(mh,c.mh);std::swap(glog,c.glog);std::swap(didx,c.didx);std::swap(dw,c.dw);std::swap(Yf,c.Yf);
+    for(int l=0;l<NL;l++){ std::swap(kcache[l],c.kcache[l]); std::swap(vcache[l],c.vcache[l]); }
+    std::swap(gm_xg,c.gm_xg);std::swap(gm_gate,c.gm_gate);std::swap(gm_up,c.gm_up);std::swap(gm_h,c.gm_h);std::swap(gm_og,c.gm_og);
+    std::swap(gm_gtok,c.gm_gtok);std::swap(gm_inv,c.gm_inv);std::swap(gm_cap,c.gm_cap);std::swap(gm_cnt,c.gm_cnt);std::swap(gm_off,c.gm_off);std::swap(gm_cur,c.gm_cur);
+    std::swap(GS,c.st); std::swap(CUB,c.cub);
+}
+static void pfctx_free(PfCtx& c){
+    cudaFree(c.xbuf);cudaFree(c.nbuf);cudaFree(c.q);cudaFree(c.k);cudaFree(c.v);cudaFree(c.att);cudaFree(c.tmp);
+    cudaFree(c.mg);cudaFree(c.mu);cudaFree(c.mh);cudaFree(c.glog);cudaFree(c.didx);cudaFree(c.dw);cudaFree(c.Yf);
+    for(int l=0;l<NL;l++){cudaFree(c.kcache[l]);cudaFree(c.vcache[l]);}
+    cudaFree(c.gm_xg);cudaFree(c.gm_gate);cudaFree(c.gm_up);cudaFree(c.gm_h);cudaFree(c.gm_og);cudaFree(c.gm_gtok);cudaFree(c.gm_inv);
+    cudaFree(c.gm_cnt);cudaFree(c.gm_off);cudaFree(c.gm_cur);
+    cublasDestroy(c.cub); cudaStreamDestroy(c.st); cudaFree(c.ws);
 }
 // returns device logits[last] -> caller. Runs full prefill.
 static void prefill(const int* dids,int S,float* dlogits_last,bool check,std::vector<std::vector<float>>* fx,const bf16* dembeds=nullptr){
@@ -852,6 +892,13 @@ struct PageSrc{
     virtual bool wait(){return false;}                        // NA==0 & none available: block for more work? false = drain + return
     virtual bool lazy(){return true;}                         // encode-on-admission (vs upfront dembeds)
     virtual bool verbose(){return true;}                      // CLI stat prints (TTFT/prefill/decode/windowed)
+    // ASYNC big-ref admission (server gundam pages): encode launches on the vision stream and the core
+    // polls completion at boundaries — decode keeps replaying meanwhile. Depth 1: result valid until next begin.
+    virtual int  enc_begin(int id){ (void)id; return -1; }    // launch async encode; ntok or -1 = fail/unsupported
+    virtual bool enc_ready(){ return true; }                  // in-flight encode finished on the GPU?
+    virtual void enc_wait(){}                                 // block until finished (idle window: nothing to overlap)
+    virtual const bf16* enc_result(){ return nullptr; }       // encoded ref (device), valid until the next enc_begin
+    virtual bool alive(int id){ (void)id; return true; }      // page's job still live (skip dead work cheaply)
     virtual ~PageSrc(){}
 };
 // ===== per-token decode confidence (read-only; token selection untouched) =====
@@ -890,7 +937,7 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
         long g=(long)(((double)freeb-3.5e9)/chunk);                             // reserve: PFG prefill scratch + per-slot decode scratch + headroom
         G=(int)std::max(1L,std::min((long)gslots_env(),g)); }
     const int WT=W+G;                                    // slot ids: [0,W) = vpp-shaped, [W,WT) = big
-    alloc(std::max(std::max(PF,PFG),WT));
+    alloc(std::max(PF,WT));                              // big-ref prefills run in their own PfCtx (async), so the shared scratch only needs PF
     std::vector<int> hkvoff(WT),hpf(WT,PF);              // per-slot KV row offset (constant) + ref length (set at admission)
     for(int s=0;s<WT;s++) hkvoff[s]=s<W?s*MS:W*MS+(s-W)*MSG;
     for(int s=W;s<WT;s++) hpf[s]=PFG;
@@ -914,43 +961,85 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
     for(int s=WT-1;s>=W;s--) freegs.push_back(s);
     bool ttft=false; float admms=0; long nadm=0; long total=0;       // cumulative admission (encode+prefill) time; total emitted tokens
     bool vb=src.verbose();
-    bf16 *pe,*vis1=nullptr; float* dlog; CK(cudaMalloc(&pe,(size_t)std::max(PF,PFG)*H*2)); CK(cudaMalloc(&dlog,(size_t)V*4));
+    bf16 *pe,*vis1=nullptr; float* dlog; CK(cudaMalloc(&pe,(size_t)PF*H*2)); CK(cudaMalloc(&dlog,(size_t)V*4));
     if(src.lazy()) CK(cudaMalloc(&vis1,(size_t)(1+(size_t)std::max(vpp,GV))*H*2));
+    PfCtx c2{}; bf16 *pe2=nullptr,*vis2=nullptr; float* dlog2=nullptr;   // ASYNC big-ref admission context (server gundam pages)
+    if(G){ pfctx_alloc(c2,PFG); CK(cudaMalloc(&pe2,(size_t)PFG*H*2)); CK(cudaMalloc(&vis2,(size_t)(1+(size_t)GV)*H*2)); CK(cudaMalloc(&dlog2,(size_t)V*4)); }
     cudaEvent_t pa,pb,aa,ab; cudaEventCreate(&pa);cudaEventCreate(&pb);cudaEventCreate(&aa);cudaEventCreate(&ab);
     CK(cudaStreamSynchronize(GS)); cudaEventRecord(pa,GS);
-    auto admit=[&](){                                                // fill free slots with the next pages: encode -> prefill -> seed slot KV
-        int gadm=2;                                                  // big-ref admissions per boundary (each ~470ms encode+prefill stalls the loop; cap spreads the cost so co-batched streams keep stepping)
-        bool bok=!freesl.empty(), gok=!freegs.empty()&&gadm>0;
-        if(!bok&&!gok) return;
-        int pid=src.next(bok,gok); if(pid<0) return;
+    auto admit=[&](){                                                // SYNC admission, base-class slots only: encode -> prefill -> seed slot KV
+        if(freesl.empty()) return;                                   // (big-ref pages go through the async pump; this path defines the idle-parity NA trajectory)
+        int pid=src.next(true,false); if(pid<0) return;
         cudaEventRecord(aa,GS);
         for(;;){
             int pv=src.vpp_of(pid); if(pv<0)pv=vpp;
-            bool big=pv>vpp; if(big)gadm--;                          // larger-than-resident ref -> big slot
-            int slot=big?freegs.back():freesl.back(); int PFp=1+pv+4;
+            int slot=freesl.back(); int PFp=1+pv+4;
             int pidx=0; const bf16* semb=src.embeds(pid,vis1,&pidx); // slot-local embeds: encoded page lives at index 0
             if(semb){
                 k_pageembeds<<<dim3(PFp,(H+255)/256),256,0,GS>>>(pe,EMB,semb,pidx,0,37460,4366,76466,16,pv);
                 prefill(nullptr,PFp,dlog,false,nullptr,pe);
                 for(int l=0;l<NL;l++){ CK(cudaMemcpyAsync(kcb[l]+(size_t)hkvoff[slot]*H,kcache[l],(size_t)PFp*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS));
                                        CK(cudaMemcpyAsync(vcb[l]+(size_t)hkvoff[slot]*H,vcache[l],(size_t)PFp*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS)); }
-                std::vector<float> ll(V); CK(cudaMemcpy(ll.data(),dlog,(size_t)V*4,cudaMemcpyDeviceToHost));
+                std::vector<float> ll(V); CK(cudaMemcpyAsync(ll.data(),dlog,(size_t)V*4,cudaMemcpyDeviceToHost,GS)); CK(cudaStreamSynchronize(GS));  // stream-scoped: don't drain VS (in-flight async encode)
                 int t=0; for(int e=1;e<V;e++) if(ll[e]>ll[t])t=e; src.out(pid).push_back(t); total++;
                 double cz=0; for(int e=0;e<V;e++) cz+=exp((double)ll[e]-ll[t]);   // first-token p1 (host; logits already here)
                 float p1=(float)(1.0/cz);
                 if(!ttft){ ttft=true; cudaEventRecord(pb,GS); CK(cudaEventSynchronize(pb)); float ms=0; cudaEventElapsedTime(&ms,pa,pb);
                            if(vb)printf("TTFT (page 0 %sprefill): %.0f ms\n",src.lazy()?"encode+":"",ms); }
-                if(t!=1){ (big?freegs:freesl).pop_back(); slot2page[slot]=pid; hsteps[slot]=0; hdone[slot]=0; active.push_back(slot); curtok.push_back(t);
-                          if(hpf[slot]!=PFp){ hpf[slot]=PFp; CK(cudaMemcpy(d_pf+slot,&hpf[slot],4,cudaMemcpyHostToDevice)); }
+                if(t!=1){ freesl.pop_back(); slot2page[slot]=pid; hsteps[slot]=0; hdone[slot]=0; active.push_back(slot); curtok.push_back(t);
+                          if(hpf[slot]!=PFp){ hpf[slot]=PFp; CK(cudaMemcpyAsync(d_pf+slot,&hpf[slot],4,cudaMemcpyHostToDevice,GS)); }
                           conf0[slot]=p1; CK(cudaMemsetAsync(d_csum+slot,0,4,GS)); CK(cudaMemsetAsync(d_clow+slot,0,4,GS)); }
                 else { src.stats(pid,p1,p1<0.5f?1.f:0.f); src.done(pid); }   // EOS at prefill: page complete without ever holding a slot
             } else src.done(pid);                                    // unrenderable page: skipped, completes empty
             nadm++;
-            bok=!freesl.empty(); gok=!freegs.empty()&&gadm>0;
-            if(!bok&&!gok) break;
-            if((pid=src.next(bok,gok))<0) break;
+            if(freesl.empty()) break;
+            if((pid=src.next(true,false))<0) break;
         }
         cudaEventRecord(ab,GS); CK(cudaEventSynchronize(ab)); float ms=0; cudaEventElapsedTime(&ms,aa,ab); admms+=ms;
+    };
+    // ASYNC big-ref admission pump: encode runs on the vision stream, prefill+seed on c2.st with swapped
+    // scratch — the decode window keeps replaying on GS throughout. Depth 1 (vision buffers are single-
+    // instance); the completed page joins the window at the next boundary via ready[]/activate().
+    struct{ int pid=-1,pv=0,stage=0; } ap;                           // stage: 0 idle, 1 encode in flight
+    struct Ready{ int slot,pid,tok; float p1; }; std::vector<Ready> ready;
+    auto pump=[&](bool block){
+        if(!G) return;
+        if(ap.stage==1){
+            if(block) src.enc_wait();
+            if(src.enc_ready()){
+                if(!src.alive(ap.pid)){ src.done(ap.pid); nadm++; ap.stage=0; }      // job died while encoding: page completes empty
+                else if(!freegs.empty()){
+                    int slot=freegs.back(); int PFp=1+ap.pv+4;
+                    pfctx_swap(c2);                                  // prefill on the admission stream+scratch (verified code path, swapped pointers)
+                    CK(cudaMemcpyAsync(vis2+H,src.enc_result(),(size_t)ap.pv*H*2,cudaMemcpyDeviceToDevice,GS));   // k_pageembeds expects visual tokens at ROW 1 (slot-local embeds convention)
+                    k_pageembeds<<<dim3(PFp,(H+255)/256),256,0,GS>>>(pe2,EMB,vis2,0,0,37460,4366,76466,16,ap.pv);
+                    prefill(nullptr,PFp,dlog2,false,nullptr,pe2);
+                    for(int l=0;l<NL;l++){ CK(cudaMemcpyAsync(kcb[l]+(size_t)hkvoff[slot]*H,kcache[l],(size_t)PFp*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS));
+                                           CK(cudaMemcpyAsync(vcb[l]+(size_t)hkvoff[slot]*H,vcache[l],(size_t)PFp*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS)); }
+                    std::vector<float> ll(V); CK(cudaMemcpyAsync(ll.data(),dlog2,(size_t)V*4,cudaMemcpyDeviceToHost,GS)); CK(cudaStreamSynchronize(GS));
+                    pfctx_swap(c2);                                  // back to the decode context
+                    int t=0; for(int e=1;e<V;e++) if(ll[e]>ll[t])t=e; src.out(ap.pid).push_back(t); total++;
+                    double cz=0; for(int e=0;e<V;e++) cz+=exp((double)ll[e]-ll[t]); float p1=(float)(1.0/cz);
+                    if(t!=1){ freegs.pop_back(); hpf[slot]=PFp; ready.push_back({slot,ap.pid,t,p1}); }
+                    else { src.stats(ap.pid,p1,p1<0.5f?1.f:0.f); src.done(ap.pid); }
+                    nadm++; ap.stage=0;
+                }                                                    // else: no free big slot — keep the encode parked (result valid until next begin)
+            }
+        }
+        if(ap.stage==0 && !freegs.empty()){                          // start the next big-ref encode (its CPU render + GPU overlap the window)
+            int pid=src.next(false,true); if(pid<0) return;
+            int pv=src.vpp_of(pid);
+            if(src.enc_begin(pid)<0){ src.done(pid); nadm++; return; }   // render failed / job dead: page completes empty
+            ap.pid=pid; ap.pv=pv; ap.stage=1;
+        }
+    };
+    auto activate=[&](){                                             // async-admitted big slots join the window at a boundary
+        for(Ready& r:ready){
+            slot2page[r.slot]=r.pid; hsteps[r.slot]=0; hdone[r.slot]=0; active.push_back(r.slot); curtok.push_back(r.tok);
+            CK(cudaMemcpyAsync(d_pf+r.slot,&hpf[r.slot],4,cudaMemcpyHostToDevice,GS));
+            conf0[r.slot]=r.p1; CK(cudaMemsetAsync(d_csum+r.slot,0,4,GS)); CK(cudaMemsetAsync(d_clow+r.slot,0,4,GS));
+        }
+        ready.clear();
     };
     admit();                                             // initial fill: first W pages (windowed) or all (classic)
     if(vb)printf("page-parallel prefill: %ld/%d pages in %.0f ms%s\n",nadm,Ntotal,admms,W<Ntotal?" (windowed)":"");
@@ -1008,20 +1097,29 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
     long wsteps=0; const int CK_EVERY=16; long stream_steps=0; bool ng=getenv("DECNOGRAPH");
     auto retire=[&](int slot){                                       // stream done: harvest its outbuf row into its page, free the slot
         int n=hsteps[slot]; std::vector<int>& out=src.out(slot2page[slot]);
-        if(n>0){ std::vector<int> row(n); CK(cudaMemcpy(row.data(),outbuf+(size_t)slot*MAXSTEP,(size_t)n*4,cudaMemcpyDeviceToHost));
-                 for(int t:row){ out.push_back(t); total++; if(t==1)break; } }
+        std::vector<int> row(n>0?n:0);                               // copies stream-scoped to GS: a legacy-stream memcpy would drain VS (in-flight async encode)
+        if(n>0) CK(cudaMemcpyAsync(row.data(),outbuf+(size_t)slot*MAXSTEP,(size_t)n*4,cudaMemcpyDeviceToHost,GS));
         float cs=0; int cl=0;                                        // harvest per-slot confidence (accumulated over n steps + prefill token)
-        CK(cudaMemcpy(&cs,d_csum+slot,4,cudaMemcpyDeviceToHost)); CK(cudaMemcpy(&cl,d_clow+slot,4,cudaMemcpyDeviceToHost));
+        CK(cudaMemcpyAsync(&cs,d_csum+slot,4,cudaMemcpyDeviceToHost,GS)); CK(cudaMemcpyAsync(&cl,d_clow+slot,4,cudaMemcpyDeviceToHost,GS));
+        CK(cudaStreamSynchronize(GS));
+        if(n>0) for(int t:row){ out.push_back(t); total++; if(t==1)break; }
         src.stats(slot2page[slot],(conf0[slot]+cs)/(n+1),((conf0[slot]<0.5f?1:0)+cl)/(float)(n+1));
         src.done(slot2page[slot]);
         (slot<W?freesl:freegs).push_back(slot);
     };
     for(;;){
         if(NA==0){
-            if(!src.wait()) break;                                   // FixedSrc: drained -> exit (the pre-refactor while(NA>0) exit)
-            admit(); NA=(int)active.size(); if(NA==0) continue;      // server: woke on new work; full device-state re-upload (slots recycled while idle)
-            CK(cudaMemcpy(d_act,active.data(),(size_t)NA*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_tokb,curtok.data(),(size_t)NA*4,cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(d_steps,hsteps.data(),(size_t)WT*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_done,hdone.data(),(size_t)WT*4,cudaMemcpyHostToDevice));
+            pump(ap.stage==1);                                       // idle window: drive async admissions FIRST (pending gundam items live in the source's rotation, not the HTTP queue) — block on an in-flight encode (nothing to overlap)
+            activate();
+            admit(); NA=(int)active.size();
+            if(NA==0){
+                if(ap.stage||!ready.empty()) continue;               // async admission in flight: don't block on the queue
+                if(!src.wait()) break;                               // truly idle: block for new jobs (FixedSrc: drained -> exit)
+                continue;
+            }
+            // server: woke on new work; full device-state re-upload (slots recycled while idle)
+            CK(cudaMemcpyAsync(d_act,active.data(),(size_t)NA*4,cudaMemcpyHostToDevice,GS)); CK(cudaMemcpyAsync(d_tokb,curtok.data(),(size_t)NA*4,cudaMemcpyHostToDevice,GS));
+            CK(cudaMemcpyAsync(d_steps,hsteps.data(),(size_t)WT*4,cudaMemcpyHostToDevice,GS)); CK(cudaMemcpyAsync(d_done,hdone.data(),(size_t)WT*4,cudaMemcpyHostToDevice,GS));
         }
         int pfmx=0; for(int s:active) pfmx=std::max(pfmx,hpf[s]);    // heterogeneous window: splits sized to the longest ACTIVE ref (uniform window -> exactly the old scalar)
         ns=std::min(NSPLITB,std::max((pfmx+WIN)/48,(284+NH*NA-1)/(NH*NA)));   // more key-splits at small NA to fill the 142 SMs (24 keys/split tried 2026-07: +1% = noise, 0.12% output drift -> reverted)
@@ -1031,13 +1129,15 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
         int hi=0; for(int s:active) hi=std::max(hi,hsteps[s]);       // outbuf rows are MAXSTEP deep -> cap the window at the furthest stream
         int nstep=std::min(CK_EVERY,MAXSTEP-hi);
         for(int i=0;i<nstep;i++,wsteps++){ stream_steps+=NA; if(ng)body(NA); else CK(cudaGraphLaunch(gcache[gkey],GS)); }
+        pump(false);                                                 // OVERLAP: big-ref encode/prefill runs while the queued window replays on GS
         CK(cudaStreamSynchronize(GS));                               // recompact: retire streams that hit EOS (or the per-stream step cap)
-        CK(cudaMemcpy(hdone.data(),d_done,(size_t)WT*4,cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(hsteps.data(),d_steps,(size_t)WT*4,cudaMemcpyDeviceToHost));
-        std::vector<int> ct(NA); CK(cudaMemcpy(ct.data(),d_tokb,(size_t)NA*4,cudaMemcpyDeviceToHost));
+        CK(cudaMemcpyAsync(hdone.data(),d_done,(size_t)WT*4,cudaMemcpyDeviceToHost,GS));
+        CK(cudaMemcpyAsync(hsteps.data(),d_steps,(size_t)WT*4,cudaMemcpyDeviceToHost,GS));
+        std::vector<int> ct(NA); CK(cudaMemcpyAsync(ct.data(),d_tokb,(size_t)NA*4,cudaMemcpyDeviceToHost,GS)); CK(cudaStreamSynchronize(GS));
         std::vector<int> na, nt;
         for(int a=0;a<NA;a++){ int s=active[a]; if(hdone[s]||hsteps[s]>=MAXSTEP) retire(s); else { na.push_back(s); nt.push_back(ct[a]); } }
         active=na; curtok=nt;
+        activate();                                                  // async-admitted big slots join here
         admit();                                                     // top the window back up (no-op when all pages already admitted)
         NA=(int)active.size();
         // BOOST: mixed window -> extra base-only sub-window. Base steps are ~10x cheaper (406-row clen,
@@ -1053,26 +1153,27 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
                 for(int i=0;i<NB;i++){ bact[i]=active[bi[i]]; btok[i]=curtok[bi[i]]; }
                 int bhi=0,bpf=0; for(int s:bact){ bhi=std::max(bhi,hsteps[s]); bpf=std::max(bpf,hpf[s]); }
                 int bstep=std::min(BOOST,MAXSTEP-bhi);
-                CK(cudaMemcpy(d_act,bact.data(),(size_t)NB*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_tokb,btok.data(),(size_t)NB*4,cudaMemcpyHostToDevice));
-                CK(cudaMemcpy(d_steps,hsteps.data(),(size_t)WT*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_done,hdone.data(),(size_t)WT*4,cudaMemcpyHostToDevice));
+                CK(cudaMemcpyAsync(d_act,bact.data(),(size_t)NB*4,cudaMemcpyHostToDevice,GS)); CK(cudaMemcpyAsync(d_tokb,btok.data(),(size_t)NB*4,cudaMemcpyHostToDevice,GS));
+                CK(cudaMemcpyAsync(d_steps,hsteps.data(),(size_t)WT*4,cudaMemcpyHostToDevice,GS)); CK(cudaMemcpyAsync(d_done,hdone.data(),(size_t)WT*4,cudaMemcpyHostToDevice,GS));
                 int bns=std::min(NSPLITB,std::max((bpf+WIN)/48,(284+NH*NB-1)/(NH*NB)));
                 int bkey=NB*(NSPLITB+1)+bns;
                 if(!ng && !gcache.count(bkey)){ cudaGraph_t g; CK(cudaStreamBeginCapture(GS,cudaStreamCaptureModeThreadLocal)); { int sv=ns; ns=bns; body(NB); ns=sv; }
                     CK(cudaStreamEndCapture(GS,&g)); cudaGraphExec_t ge; CK(cudaGraphInstantiate(&ge,g,nullptr,nullptr,0)); cudaGraphDestroy(g); gcache[bkey]=ge; }
                 if(ng){ int sv=ns; ns=bns; for(int i=0;i<bstep;i++,wsteps++){ stream_steps+=NB; body(NB); } ns=sv; }
                 else  for(int i=0;i<bstep;i++,wsteps++){ stream_steps+=NB; CK(cudaGraphLaunch(gcache[bkey],GS)); }
+                pump(false);                                         // keep the big-ref pipeline moving during the booster too
                 CK(cudaStreamSynchronize(GS));
-                CK(cudaMemcpy(hdone.data(),d_done,(size_t)WT*4,cudaMemcpyDeviceToHost));
-                CK(cudaMemcpy(hsteps.data(),d_steps,(size_t)WT*4,cudaMemcpyDeviceToHost));
-                std::vector<int> bct(NB); CK(cudaMemcpy(bct.data(),d_tokb,(size_t)NB*4,cudaMemcpyDeviceToHost));
+                CK(cudaMemcpyAsync(hdone.data(),d_done,(size_t)WT*4,cudaMemcpyDeviceToHost,GS));
+                CK(cudaMemcpyAsync(hsteps.data(),d_steps,(size_t)WT*4,cudaMemcpyDeviceToHost,GS));
+                std::vector<int> bct(NB); CK(cudaMemcpyAsync(bct.data(),d_tokb,(size_t)NB*4,cudaMemcpyDeviceToHost,GS)); CK(cudaStreamSynchronize(GS));
                 for(int i=0;i<NB;i++) curtok[bi[i]]=bct[i];
                 std::vector<int> na2,nt2;
                 for(int a=0;a<NA;a++){ int s=active[a]; if(hdone[s]||hsteps[s]>=MAXSTEP) retire(s); else { na2.push_back(s); nt2.push_back(curtok[a]); } }
                 active=na2; curtok=nt2; NA=(int)active.size();
             }
         }
-        if(NA>0){ CK(cudaMemcpy(d_act,active.data(),(size_t)NA*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_tokb,curtok.data(),(size_t)NA*4,cudaMemcpyHostToDevice));
-                  CK(cudaMemcpy(d_steps,hsteps.data(),(size_t)WT*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_done,hdone.data(),(size_t)WT*4,cudaMemcpyHostToDevice)); }
+        if(NA>0){ CK(cudaMemcpyAsync(d_act,active.data(),(size_t)NA*4,cudaMemcpyHostToDevice,GS)); CK(cudaMemcpyAsync(d_tokb,curtok.data(),(size_t)NA*4,cudaMemcpyHostToDevice,GS));
+                  CK(cudaMemcpyAsync(d_steps,hsteps.data(),(size_t)WT*4,cudaMemcpyHostToDevice,GS)); CK(cudaMemcpyAsync(d_done,hdone.data(),(size_t)WT*4,cudaMemcpyHostToDevice,GS)); }
     }
     cudaEventRecord(db,GS); CK(cudaEventSynchronize(db)); float dms=0; cudaEventElapsedTime(&dms,da,db);
     if(vb){
@@ -1080,6 +1181,7 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
         if(W<Ntotal) printf("windowed: %d pages through %d slots, %ld admissions %.0f ms interleaved (KV resident: %d x %d entries/layer)\n",Ntotal,W,nadm,admms,W,MS);
     }
     for(auto&kv:gcache) cudaGraphExecDestroy(kv.second);                 // free per-call GPU scratch (Gundam calls this per page)
+    if(G){ pfctx_free(c2); cudaFree(pe2); cudaFree(vis2); cudaFree(dlog2); }
     cudaFree(d_pf); cudaFree(d_kvoff);
     for(int l=0;l<NL;l++){ cudaFree(kcb[l]); cudaFree(vcb[l]); kcb[l]=nullptr; vcb[l]=nullptr; }
     cudaFree(atb_pm); cudaFree(atb_pl); cudaFree(atb_pacc); atb_pm=atb_pl=atb_pacc=nullptr;
@@ -1152,6 +1254,7 @@ static void enc_base(int p,bf16* dst){                               // encode p
 // page count -> UNLIMITED gundam pages at flat memory, no page cap. Mixed page sizes -> sequential per-page
 // (already one-page-at-a-time = flat memory). po gets one token stream per page. false = a page failed.
 extern int gundam_encode(const char* pdf,int page); extern bf16* gundam_result();
+extern int gundam_encode_begin(const char* pdf,int page); extern int gundam_encode_ready(); extern void gundam_encode_wait();
 extern int gundam_page_ntok(const char* pdf,int page);   // token count from page dims only (no encode)
 static const char* g_gpdf=nullptr; static const std::vector<int>* g_gpgs=nullptr; static const std::vector<int>* g_gvpps=nullptr;  // enc_gundam callback state
 static void enc_gundam(int id,bf16* dst){                // encode gundam page pgs[id] into a slot's reference (vpp=vpps[id])
@@ -1304,6 +1407,18 @@ struct QueueSrc final : PageSrc{
     bool verbose() override { return false; }
     int vpp_of(int id) override { return items.at(id).vpp; }
     int vpp_gmax() override { return GVPP_MAX; }           // server may see any gundam tiling -> allocate big slots
+    int enc_begin(int id) override {                       // ASYNC gundam encode: launch render+SAM/CLIP on the vision stream
+        Item& it=items.at(id);
+        if(it.job->status!=200) return -1;
+        int nt=gundam_encode_begin(it.job->path.c_str(),it.pdfpage);
+        enc_invalidate();                                  // the render clobbered the base-prefetch vision input
+        if(nt!=it.vpp){ it.job->status=422; it.job->err="page render failed"; return -1; }
+        return nt;
+    }
+    bool enc_ready() override { return gundam_encode_ready(); }
+    void enc_wait() override { gundam_encode_wait(); }
+    const bf16* enc_result() override { return gundam_result(); }
+    bool alive(int id) override { return items.at(id).job->status==200; }
 };
 static void engine_serve(){                                // never returns (fail-fast: CUDA errors exit(1), supervisor restarts)
     static int wcap=[](){const char* s=getenv("WINDOW");return s?atoi(s):128;}();

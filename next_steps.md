@@ -32,12 +32,20 @@ engine bug; 0 hazards before abort; sanitize.sh now ulimit-guards it, see ULIM).
 112pg base 18,306 tok/s / TTFT 356ms / 12.4s e2e; gundam-50 34.4s (matches pre-change references).
 Assets: testdata/mixed_ratio.pdf.
 
-## Next lever — async admission (not built)
-A gundam admission still costs ~470ms serial on the engine thread (~150ms MuPDF render + ~200ms
-SAM/CLIP encode + ~270ms prefill(3.8k)); it is THE remaining latency tax on co-batched streams
-(base-under-gundam ~8s vs ~3-4s achievable). Vision is already launch/sync split on VS. Plan:
-1. Encode async: launch render+encode at boundary N, event-poll, finish (prefill+seed) at N+k.
-2. Prefill overlap needs a second scratch set + cuBLAS handle (prefill/mlp_block/moe_grouped use
-   file-scope globals shared with the decode body — single-thread pointer-swap trick, or a Scratch&
-   parameter refactor). Keep base admission synchronous (it defines the idle-parity NA trajectory).
-3. Gundam render prefetch (mirror `enc_page`'s CPU-render-during-GPU-encode) is the cheap first slice.
+## Async admission — SHIPPED 2026-07-04 (DESIGN.md "Async big-ref admission")
+Encode launches on VS (gundam_encode_begin + event) during the decode window; prefill runs on a second
+stream with a pointer-swapped PfCtx (scratch + gm pools + cuBLAS handle) — bit-identical (idle gundam
+parity byte-exact through the async path). All loop copies stream-scoped (legacy-stream cudaMemcpy
+drains other streams — the overlap killer). Base admission stays sync (parity trajectory). Measured:
+base-under-gundam 8.2s -> 2.3s (GSLOTS=8) / 4.5s (GSLOTS=32); gundam-50 36.6s, 112pg 18.3k tok/s — no
+regressions. Gotchas fixed en route: NA==0 must pump before srv_wait_work (auto-hires items live in the
+rotation, not the HTTP queue -> deadlock); encoded ref must stage at ROW 1 of the embeds buffer (direct
+gundam_result() shifted all visual tokens one row — decode still "worked" at conf 0.92; only the
+byte-parity gate caught it); vision CK() macro shadows `e` (CK(e) self-inits).
+
+## Remaining headroom (not built)
+- Encode pipeline depth 2 (staging buffer for the assembled ref) — admission rate is now bounded by
+  one encode per boundary; depth 2 would decouple render(k+1) from prefill(k). Modest.
+- Gundam render prefetch (mirror enc_page's CPU-render-during-GPU-encode) — hides ~150ms MuPDF render.
+- Base admissions during an in-flight gundam encode wait <=~200ms in vis_gpu_sync (shared VS); a second
+  vision buffer set would remove it. Bounded and rare; likely not worth it.
