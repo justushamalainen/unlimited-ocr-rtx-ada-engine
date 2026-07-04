@@ -205,6 +205,7 @@ static void handle(int fd){
     }
     if(qparam(r.query,"gundam",v)) gundam=(v=="1");
     bool autohires=true; if(qparam(r.query,"auto",v)) autohires=(v!="0");   // server re-OCRs flagged base pages in gundam before returning
+    bool feats=false; if(qparam(r.query,"feats",v)) feats=(v=="1");         // emit the full X-Page-Feats vector (eval harness / power clients)
     if(queue_depth()>=QCAP){ resp(fd,503,"Service Unavailable","queue full\n","Retry-After: 10\r\n"); return; }
     if(r.expect100){ const char* c="HTTP/1.1 100 Continue\r\n\r\n"; if(!send_all(fd,c,strlen(c))){ close(fd); return; } }
     // spool body (header carryover first, then stream)
@@ -232,7 +233,7 @@ static void handle(int fd){
         else close(fd);                                    // client vanished mid-upload: no response owed
         return; }
     // enqueue + wait (v1: no cancel — a disconnected client's job completes and is discarded)
-    auto j=std::make_shared<OcrJob>(); j->path=path; j->npages=npages; j->gundam=gundam; j->pagelist=std::move(pagelist); j->auto_hires=autohires;
+    auto j=std::make_shared<OcrJob>(); j->path=path; j->npages=npages; j->gundam=gundam; j->pagelist=std::move(pagelist); j->auto_hires=autohires; j->want_feats=feats;
     if(!enqueue(j)){ unlink(path); resp(fd,503,"Service Unavailable","queue full\n","Retry-After: 10\r\n"); return; }
     { std::unique_lock<std::mutex> lk(j->m); j->cv.wait(lk,[&]{return j->done;}); }
     unlink(path);
@@ -252,12 +253,20 @@ static void handle(int fd){
                           j->pages,j->tokens,j->truncated,ms);
     std::string extra=x;
     if(!j->page_conf.empty() && j->page_conf.size()<=2048){          // per-page decode confidence (header stays bounded)
-        char n[16]; std::string c="X-Page-Conf: ", l="X-Page-LowConf: ";
+        char n[48]; std::string c="X-Page-Conf: ", l="X-Page-LowConf: ", k="X-Page-Risk: ";
         for(size_t i=0;i<j->page_conf.size();i++){
             snprintf(n,sizeof n,"%s%.2f",i?",":"",j->page_conf[i]);    c+=n;
             snprintf(n,sizeof n,"%s%.2f",i?",":"",j->page_lowfrac[i]); l+=n;
+            snprintf(n,sizeof n,"%s%.2f",i?",":"",i<j->page_risk.size()?j->page_risk[i]:0.f); k+=n;
         }
-        extra+=c+"\r\n"+l+"\r\n";
+        extra+=c+"\r\n"+l+"\r\n"+k+"\r\n";
+        if(j->want_feats && j->page_feats.size()<=512){              // full feature vector per page (?feats=1): p10:wminp:emean:wment:regp:ntok
+            std::string ftr="X-Page-Feats: ";
+            for(size_t i=0;i<j->page_feats.size();i++){ const PageConf& pc=j->page_feats[i];
+                snprintf(n,sizeof n,"%s%.3f:%.3f:%.3f:%.3f:%.3f:%d",i?";":"",pc.p10,pc.wminp,pc.emean,pc.wment,pc.regp,pc.ntok); ftr+=n;
+            }
+            extra+=ftr+"\r\n";
+        }
     }
     resp(fd,200,"OK",text,extra);
 }

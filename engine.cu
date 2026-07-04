@@ -10,6 +10,7 @@
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#include <algorithm>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -484,12 +485,16 @@ extern int vis_page_count(const char* pdf);            // -1 = unreadable
 extern void vis_doc_close(const char* pdf);            // drop doc-cache entry (recycled server temp paths)
 // byte-level BPE decoder (build asset vocab.bin: id -> byte-level utf8 string)
 static std::vector<std::string> g_vocab; static std::map<uint32_t,unsigned char> g_bdec;
+static std::vector<uint8_t> g_toknl;                     // token id -> decoded piece contains '\n' (line-region splits for confidence features)
+static std::string bpe_decode(const std::vector<int>& ids);
 static void load_vocab(const char* path){
     FILE* f=fopen(path,"rb"); int n; if(fread(&n,4,1,f)!=1){} g_vocab.resize(n);
     for(int i=0;i<n;i++){ int len; if(fread(&len,4,1,f)!=1){} std::string s(len,0); if(len&&fread(&s[0],1,len,f)!=(size_t)len){} g_vocab[i]=s; } fclose(f);
     std::vector<int> bs; for(int b='!';b<='~';b++)bs.push_back(b); for(int b=0xA1;b<=0xAC;b++)bs.push_back(b); for(int b=0xAE;b<=0xFF;b++)bs.push_back(b);
     std::vector<int> cs=bs; int m=0; for(int b=0;b<256;b++){bool in=false;for(int x:bs)if(x==b){in=true;break;} if(!in){bs.push_back(b);cs.push_back(256+m);m++;}}
     for(size_t i=0;i<bs.size();i++) g_bdec[(uint32_t)cs[i]]=(unsigned char)bs[i];
+    g_toknl.assign(n,0); std::vector<int> one(1);
+    for(int i=0;i<n;i++){ one[0]=i; if(bpe_decode(one).find('\n')!=std::string::npos) g_toknl[i]=1; }
 }
 static std::string bpe_decode(const std::vector<int>& ids){
     std::string ob;
@@ -887,7 +892,7 @@ struct PageSrc{
     virtual int  vpp_gmax(){ return 0; }                      // >0: may yield refs larger than vpp (server gundam) -> allocate big slots
     virtual const bf16* embeds(int id,bf16* scr,int* pidx)=0; // visual embeds (encode into scr, or upfront buffer + *pidx); nullptr = page unrenderable -> skipped, no slot consumed
     virtual std::vector<int>& out(int id)=0;                  // per-page token sink
-    virtual void stats(int id,float conf,float lowfrac){}     // decode confidence: mean top-1 prob + frac of steps with p1<0.5 (before done)
+    virtual void stats(int id,const PageConf& pc){ (void)id;(void)pc; }   // decode-confidence features (before done)
     virtual void done(int id){}                               // page complete (EOS-at-prefill or retire)
     virtual bool wait(){return false;}                        // NA==0 & none available: block for more work? false = drain + return
     virtual bool lazy(){return true;}                         // encode-on-admission (vs upfront dembeds)
@@ -902,30 +907,63 @@ struct PageSrc{
     virtual ~PageSrc(){}
 };
 // ===== per-token decode confidence (read-only; token selection untouched) =====
-// p1 = softmax prob of the emitted token. Small-NA path: exact over the FULL logits (emitted token
-// is the post-mask max). Rescore path: over the 1024 exact-rescored candidates (tail mass negligible
-// — the same property that makes the rescore token-exact). Accumulated per SLOT, harvested at retire.
-__global__ void k_conf_b(const float* logits,const int* tok,float* csum,int* clow,const int* act,int Vn){  // grid(na) block 1024
+// p1 = softmax prob of the emitted token; ent = Shannon entropy of the step distribution (nats).
+// Small-NA path: exact over the FULL logits (emitted token is the post-mask max). Rescore path: over
+// the 1024 exact-rescored candidates (tail mass negligible — the same property that makes the rescore
+// token-exact). Written as per-slot per-STEP traces; features computed host-side at retire.
+// Entropy from the same pass: with logits shifted by max mt, H = ln(Z) - (sum e^x * x)/Z.
+__global__ void k_conf_b(const float* logits,const int* tok,float* p1t,float* entt,const int* dstep,int maxstep,const int* act,int Vn){  // grid(na) block 1024
     int s=blockIdx.x; const float* lg=logits+(size_t)s*Vn;
     float mt=lg[tok[s]];                                 // emitted token = post-mask argmax -> its logit IS the max (no max pass needed)
-    __shared__ float se[1024];
-    float e=0;
-    for(int i=threadIdx.x;i<Vn;i+=1024){ float x=lg[i]; if(x>-1e29f) e+=__expf(x-mt); }
-    se[threadIdx.x]=e; __syncthreads();
-    for(int o=512;o;o>>=1){ if(threadIdx.x<o) se[threadIdx.x]+=se[threadIdx.x+o]; __syncthreads(); }
-    if(!threadIdx.x){ float p1=1.f/se[0]; int ps=act[s]; atomicAdd(&csum[ps],p1); if(p1<0.5f) atomicAdd(&clow[ps],1); }
+    __shared__ float se[1024],sx[1024];
+    float e=0,w=0;
+    for(int i=threadIdx.x;i<Vn;i+=1024){ float x=lg[i]; if(x>-1e29f){ float ex=__expf(x-mt); e+=ex; w+=ex*(x-mt); } }
+    se[threadIdx.x]=e; sx[threadIdx.x]=w; __syncthreads();
+    for(int o=512;o;o>>=1){ if(threadIdx.x<o){ se[threadIdx.x]+=se[threadIdx.x+o]; sx[threadIdx.x]+=sx[threadIdx.x+o]; } __syncthreads(); }
+    if(!threadIdx.x){ int ps=act[s]; float Z=se[0]; size_t o=(size_t)ps*maxstep+dstep[ps];
+        p1t[o]=1.f/Z; entt[o]=__logf(Z)-sx[0]/Z; }
 }
-__global__ void k_conf_cand_b(const float* cval,float* csum,int* clow,const int* act,int nc){ // grid(na) block 256
+__global__ void k_conf_cand_b(const float* cval,float* p1t,float* entt,const int* dstep,int maxstep,const int* act,int nc){ // grid(na) block 256
     int s=blockIdx.x; const float* v=cval+(size_t)s*nc;
-    __shared__ float mx[256], se[256];
+    __shared__ float mx[256], se[256], sx[256];
     float m=-1e30f; for(int i=threadIdx.x;i<nc;i+=256) m=fmaxf(m,v[i]);
     mx[threadIdx.x]=m; __syncthreads();
     for(int o=128;o;o>>=1){ if(threadIdx.x<o) mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+o]); __syncthreads(); }
-    float mt=mx[0]; float e=0;
-    for(int i=threadIdx.x;i<nc;i+=256){ float x=v[i]; if(x>-1e29f) e+=__expf(x-mt); }
-    se[threadIdx.x]=e; __syncthreads();
-    for(int o=128;o;o>>=1){ if(threadIdx.x<o) se[threadIdx.x]+=se[threadIdx.x+o]; __syncthreads(); }
-    if(!threadIdx.x){ float p1=1.f/se[0]; int ps=act[s]; atomicAdd(&csum[ps],p1); if(p1<0.5f) atomicAdd(&clow[ps],1); }
+    float mt=mx[0]; float e=0,w=0;
+    for(int i=threadIdx.x;i<nc;i+=256){ float x=v[i]; if(x>-1e29f){ float ex=__expf(x-mt); e+=ex; w+=ex*(x-mt); } }
+    se[threadIdx.x]=e; sx[threadIdx.x]=w; __syncthreads();
+    for(int o=128;o;o>>=1){ if(threadIdx.x<o){ se[threadIdx.x]+=se[threadIdx.x+o]; sx[threadIdx.x]+=sx[threadIdx.x+o]; } __syncthreads(); }
+    if(!threadIdx.x){ int ps=act[s]; float Z=se[0]; size_t o=(size_t)ps*maxstep+dstep[ps];
+        p1t[o]=1.f/Z; entt[o]=__logf(Z)-sx[0]/Z; }
+}
+// host-side feature extraction from the traces (at retire). toks aligned with trace steps; post-EOS
+// steps (stream keeps stepping to the boundary) are EXCLUDED — cut at the first EOS.
+static PageConf conf_features(float conf0,float ent0,const std::vector<float>& p1,const std::vector<float>& ent,const std::vector<int>& toks){
+    PageConf pc; int n=(int)p1.size();
+    for(int i=0;i<n;i++) if(i<(int)toks.size()&&toks[i]==1){ n=i+1; break; }   // cut at EOS
+    std::vector<float> p; p.reserve(n+1); p.push_back(conf0); for(int i=0;i<n;i++) p.push_back(p1[i]);
+    std::vector<float> e; e.reserve(n+1); e.push_back(ent0);  for(int i=0;i<n;i++) e.push_back(ent[i]);
+    int m=(int)p.size(); pc.ntok=m;
+    double ps=0,es=0; int lo=0;
+    for(int i=0;i<m;i++){ ps+=p[i]; es+=e[i]; if(p[i]<0.5f)lo++; }
+    pc.conf=(float)(ps/m); pc.lowf=(float)lo/m; pc.emean=(float)(es/m);
+    std::vector<float> srt=p; std::sort(srt.begin(),srt.end());
+    pc.p10=srt[(size_t)(0.10*(m-1))];
+    const int WI=32;                                     // sliding windows (errors cluster locally)
+    if(m<=WI){ pc.wminp=pc.conf; pc.wment=pc.emean; }
+    else{ double wp=0,we=0; for(int i=0;i<WI;i++){ wp+=p[i]; we+=e[i]; }
+          double mnp=wp,mxe=we;
+          for(int i=WI;i<m;i++){ wp+=p[i]-p[i-WI]; we+=e[i]-e[i-WI]; mnp=std::min(mnp,wp); mxe=std::max(mxe,we); }
+          pc.wminp=(float)(mnp/WI); pc.wment=(float)(mxe/WI); }
+    pc.regp=pc.conf;                                     // worst line-region mean p1 (fallback: page mean when vocab not loaded)
+    if(!g_toknl.empty()){
+        const int RMIN=24; float best=1e9f; double rs=0; int rn=0; bool any=false;
+        for(int i=0;i<n;i++){ rs+=p1[i]; rn++;
+            bool nl=(size_t)toks[i]<g_toknl.size() && g_toknl[toks[i]];
+            if((nl&&rn>=RMIN)||i==n-1){ if(rn>=RMIN||!any){ best=std::min(best,(float)(rs/rn)); any=true; } rs=0; rn=0; } }
+        if(any) pc.regp=best;
+    }
+    return pc;
 }
 static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
     const int PF=1+vpp+4, MS=PF+WIN;                     // ref = 1 bos + vpp visual + 4 prompt (273=Base, larger=Gundam)
@@ -947,11 +985,11 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
     CK(cudaMalloc(&atb_pm,(size_t)WT*NH*NSPLITB*4)); CK(cudaMalloc(&atb_pl,(size_t)WT*NH*NSPLITB*4)); CK(cudaMalloc(&atb_pacc,(size_t)WT*NH*NSPLITB*HD*4));
     tc_bs=std::max(16,WT); CK(cudaMalloc(&tc_cnt,NEXP*4)); CK(cudaMalloc(&tc_bin,(size_t)NEXP*tc_bs*4)); CK(cudaMalloc(&tc_part,(size_t)WT*TOPK*H*4));
     CK(cudaMalloc(&lmh_cand,(size_t)WT*NBAM*LMTOPK*4)); CK(cudaMalloc(&lmh_cval,(size_t)WT*NBAM*LMTOPK*4));
-    float* d_csum; int* d_clow; CK(cudaMalloc(&d_csum,(size_t)WT*4)); CK(cudaMalloc(&d_clow,(size_t)WT*4));  // per-slot confidence accumulators
-    CK(cudaMemset(d_csum,0,(size_t)WT*4)); CK(cudaMemset(d_clow,0,(size_t)WT*4));
-    std::vector<float> conf0(WT,0.f);                                // prefill first-token p1 per slot (host-computed)
+    std::vector<float> conf0(WT,0.f),ent0v(WT,0.f);                  // prefill first-token p1/entropy per slot (host-computed)
     CK(cudaMalloc(&qkvbb,(size_t)WT*3*H*2)); CK(cudaMalloc(&dlogb,(size_t)WT*V*4)); CK(cudaMalloc(&d_tokb,(size_t)WT*4));
     const int MAXSTEP=4096;
+    float *d_p1t,*d_entt;                                            // per-slot per-STEP confidence traces (read-only wrt token selection)
+    CK(cudaMalloc(&d_p1t,(size_t)WT*MAXSTEP*4)); CK(cudaMalloc(&d_entt,(size_t)WT*MAXSTEP*4));
     int *d_steps,*outbuf,*d_done,*d_act;                             // all slot-indexed; d_act maps active idx -> slot
     CK(cudaMalloc(&d_steps,(size_t)WT*4)); CK(cudaMalloc(&outbuf,(size_t)WT*MAXSTEP*4)); CK(cudaMalloc(&d_done,(size_t)WT*4)); CK(cudaMalloc(&d_act,(size_t)WT*4));
     CK(cudaMemset(outbuf,0,(size_t)WT*MAXSTEP*4));                   // slots are re-read up to each stream's own step only; memset keeps initcheck clean
@@ -982,14 +1020,14 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
                                        CK(cudaMemcpyAsync(vcb[l]+(size_t)hkvoff[slot]*H,vcache[l],(size_t)PFp*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS)); }
                 std::vector<float> ll(V); CK(cudaMemcpyAsync(ll.data(),dlog,(size_t)V*4,cudaMemcpyDeviceToHost,GS)); CK(cudaStreamSynchronize(GS));  // stream-scoped: don't drain VS (in-flight async encode)
                 int t=0; for(int e=1;e<V;e++) if(ll[e]>ll[t])t=e; src.out(pid).push_back(t); total++;
-                double cz=0; for(int e=0;e<V;e++) cz+=exp((double)ll[e]-ll[t]);   // first-token p1 (host; logits already here)
-                float p1=(float)(1.0/cz);
+                double cz=0,sxe=0; for(int e=0;e<V;e++){ double d=(double)ll[e]-ll[t],ex=exp(d); cz+=ex; sxe+=ex*d; }   // first-token p1+entropy (host; logits already here)
+                float p1=(float)(1.0/cz),e0=(float)(log(cz)-sxe/cz);
                 if(!ttft){ ttft=true; cudaEventRecord(pb,GS); CK(cudaEventSynchronize(pb)); float ms=0; cudaEventElapsedTime(&ms,pa,pb);
                            if(vb)printf("TTFT (page 0 %sprefill): %.0f ms\n",src.lazy()?"encode+":"",ms); }
                 if(t!=1){ freesl.pop_back(); slot2page[slot]=pid; hsteps[slot]=0; hdone[slot]=0; active.push_back(slot); curtok.push_back(t);
                           if(hpf[slot]!=PFp){ hpf[slot]=PFp; CK(cudaMemcpyAsync(d_pf+slot,&hpf[slot],4,cudaMemcpyHostToDevice,GS)); }
-                          conf0[slot]=p1; CK(cudaMemsetAsync(d_csum+slot,0,4,GS)); CK(cudaMemsetAsync(d_clow+slot,0,4,GS)); }
-                else { src.stats(pid,p1,p1<0.5f?1.f:0.f); src.done(pid); }   // EOS at prefill: page complete without ever holding a slot
+                          conf0[slot]=p1; ent0v[slot]=e0; }
+                else { src.stats(pid,conf_features(p1,e0,{},{},{})); src.done(pid); }   // EOS at prefill: page complete without ever holding a slot
             } else src.done(pid);                                    // unrenderable page: skipped, completes empty
             nadm++;
             if(freesl.empty()) break;
@@ -1001,7 +1039,7 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
     // scratch — the decode window keeps replaying on GS throughout. Depth 1 (vision buffers are single-
     // instance); the completed page joins the window at the next boundary via ready[]/activate().
     struct{ int pid=-1,pv=0,stage=0; } ap;                           // stage: 0 idle, 1 encode in flight
-    struct Ready{ int slot,pid,tok; float p1; }; std::vector<Ready> ready;
+    struct Ready{ int slot,pid,tok; float p1,e0; }; std::vector<Ready> ready;
     auto pump=[&](bool block){
         if(!G) return;
         if(ap.stage==1){
@@ -1019,9 +1057,10 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
                     std::vector<float> ll(V); CK(cudaMemcpyAsync(ll.data(),dlog2,(size_t)V*4,cudaMemcpyDeviceToHost,GS)); CK(cudaStreamSynchronize(GS));
                     pfctx_swap(c2);                                  // back to the decode context
                     int t=0; for(int e=1;e<V;e++) if(ll[e]>ll[t])t=e; src.out(ap.pid).push_back(t); total++;
-                    double cz=0; for(int e=0;e<V;e++) cz+=exp((double)ll[e]-ll[t]); float p1=(float)(1.0/cz);
-                    if(t!=1){ freegs.pop_back(); hpf[slot]=PFp; ready.push_back({slot,ap.pid,t,p1}); }
-                    else { src.stats(ap.pid,p1,p1<0.5f?1.f:0.f); src.done(ap.pid); }
+                    double cz=0,sxe=0; for(int e=0;e<V;e++){ double d=(double)ll[e]-ll[t],ex=exp(d); cz+=ex; sxe+=ex*d; }
+                    float p1=(float)(1.0/cz),e0=(float)(log(cz)-sxe/cz);
+                    if(t!=1){ freegs.pop_back(); hpf[slot]=PFp; ready.push_back({slot,ap.pid,t,p1,e0}); }
+                    else { src.stats(ap.pid,conf_features(p1,e0,{},{},{})); src.done(ap.pid); }
                     nadm++; ap.stage=0;
                 }                                                    // else: no free big slot — keep the encode parked (result valid until next begin)
             }
@@ -1037,7 +1076,7 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
         for(Ready& r:ready){
             slot2page[r.slot]=r.pid; hsteps[r.slot]=0; hdone[r.slot]=0; active.push_back(r.slot); curtok.push_back(r.tok);
             CK(cudaMemcpyAsync(d_pf+r.slot,&hpf[r.slot],4,cudaMemcpyHostToDevice,GS));
-            conf0[r.slot]=r.p1; CK(cudaMemsetAsync(d_csum+r.slot,0,4,GS)); CK(cudaMemsetAsync(d_clow+r.slot,0,4,GS));
+            conf0[r.slot]=r.p1; ent0v[r.slot]=r.e0;
         }
         ready.clear();
     };
@@ -1086,8 +1125,8 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
                 if(mm) printf("LMHDBG na%d MISMATCH %d/%d\n",na,mm,na); }
         }
         else k_argmax_b<<<na,256,0,GS>>>(dlogb,d_tokb,V);
-        if(lmx) k_conf_cand_b<<<na,256,0,GS>>>(lmh_cval,d_csum,d_clow,d_act,NBAM*LMTOPK);   // read-only confidence accumulation
-        else    k_conf_b<<<na,1024,0,GS>>>(dlogb,d_tokb,d_csum,d_clow,d_act,V);
+        if(lmx) k_conf_cand_b<<<na,256,0,GS>>>(lmh_cval,d_p1t,d_entt,d_steps,MAXSTEP,d_act,NBAM*LMTOPK);   // read-only confidence traces
+        else    k_conf_b<<<na,1024,0,GS>>>(dlogb,d_tokb,d_p1t,d_entt,d_steps,MAXSTEP,d_act,V);
         k_record_b<<<na,1,0,GS>>>(outbuf,d_tokb,d_steps,MAXSTEP,d_act);
         k_setdone_b<<<na,1,0,GS>>>(d_done,d_tokb,d_act);
         k_incstep_b<<<na,1,0,GS>>>(d_steps,d_act);
@@ -1095,15 +1134,15 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
     std::map<int,cudaGraphExec_t> gcache;                           // one captured step-graph per (active-count, key-split count) — ns is baked into the grid
     cudaEvent_t da,db; cudaEventCreate(&da);cudaEventCreate(&db); CK(cudaStreamSynchronize(GS)); cudaEventRecord(da,GS);
     long wsteps=0; const int CK_EVERY=16; long stream_steps=0; bool ng=getenv("DECNOGRAPH");
-    auto retire=[&](int slot){                                       // stream done: harvest its outbuf row into its page, free the slot
+    auto retire=[&](int slot){                                       // stream done: harvest its outbuf row + confidence traces, free the slot
         int n=hsteps[slot]; std::vector<int>& out=src.out(slot2page[slot]);
-        std::vector<int> row(n>0?n:0);                               // copies stream-scoped to GS: a legacy-stream memcpy would drain VS (in-flight async encode)
-        if(n>0) CK(cudaMemcpyAsync(row.data(),outbuf+(size_t)slot*MAXSTEP,(size_t)n*4,cudaMemcpyDeviceToHost,GS));
-        float cs=0; int cl=0;                                        // harvest per-slot confidence (accumulated over n steps + prefill token)
-        CK(cudaMemcpyAsync(&cs,d_csum+slot,4,cudaMemcpyDeviceToHost,GS)); CK(cudaMemcpyAsync(&cl,d_clow+slot,4,cudaMemcpyDeviceToHost,GS));
+        std::vector<int> row(n>0?n:0); std::vector<float> p1v(n>0?n:0),env(n>0?n:0);   // copies stream-scoped to GS: a legacy-stream memcpy would drain VS (in-flight async encode)
+        if(n>0){ CK(cudaMemcpyAsync(row.data(),outbuf+(size_t)slot*MAXSTEP,(size_t)n*4,cudaMemcpyDeviceToHost,GS));
+                 CK(cudaMemcpyAsync(p1v.data(),d_p1t+(size_t)slot*MAXSTEP,(size_t)n*4,cudaMemcpyDeviceToHost,GS));
+                 CK(cudaMemcpyAsync(env.data(),d_entt+(size_t)slot*MAXSTEP,(size_t)n*4,cudaMemcpyDeviceToHost,GS)); }
         CK(cudaStreamSynchronize(GS));
         if(n>0) for(int t:row){ out.push_back(t); total++; if(t==1)break; }
-        src.stats(slot2page[slot],(conf0[slot]+cs)/(n+1),((conf0[slot]<0.5f?1:0)+cl)/(float)(n+1));
+        src.stats(slot2page[slot],conf_features(conf0[slot],ent0v[slot],p1v,env,row));
         src.done(slot2page[slot]);
         (slot<W?freesl:freegs).push_back(slot);
     };
@@ -1187,7 +1226,7 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
     cudaFree(atb_pm); cudaFree(atb_pl); cudaFree(atb_pacc); atb_pm=atb_pl=atb_pacc=nullptr;
     cudaFree(tc_cnt); cudaFree(tc_bin); cudaFree(tc_part); tc_cnt=tc_bin=nullptr; tc_part=nullptr;
     cudaFree(lmh_cand); cudaFree(lmh_cval); lmh_cand=nullptr; lmh_cval=nullptr;
-    cudaFree(d_csum); cudaFree(d_clow);
+    cudaFree(d_p1t); cudaFree(d_entt);
     cudaFree(qkvbb); cudaFree(dlogb); cudaFree(d_tokb); qkvbb=nullptr; dlogb=nullptr; d_tokb=nullptr;
     cudaFree(d_steps); cudaFree(outbuf); cudaFree(d_done); cudaFree(d_act);  // (cubws is persistent: cuBLAS holds it)
     cudaFree(pe); cudaFree(dlog); if(vis1)cudaFree(vis1);
@@ -1205,7 +1244,7 @@ struct FixedSrc final : PageSrc{
         *pidx=id; return dembeds;                                    // upfront embeds: page id indexes the caller's buffer
     }
     std::vector<int>& out(int id) override { return (*po)[id]; }
-    void stats(int id,float c,float lf) override { if(conf)(*conf)[id]=c; if(lowf)(*lowf)[id]=lf; }
+    void stats(int id,const PageConf& pc) override { if(conf)(*conf)[id]=pc.conf; if(lowf)(*lowf)[id]=pc.lowf; }
     bool lazy() override { return encpg!=nullptr; }
 };
 static int window_env(){ static int w=[](){const char* s=getenv("WINDOW");return s?atoi(s):128;}(); return w; }
@@ -1293,8 +1332,14 @@ std::string ocr_decode_tokens(const std::vector<int>& toks){
     for(int t:toks) if(t!=1) keep.push_back(t);
     return bpe_decode(keep);
 }
-// ===== page quality gates (mirror the viewer; drive server-side auto hi-res) =====
-static const float CONF_T=0.80f, LOW_T=0.20f;   // low-confidence: mean top-1 prob < 0.80 or >20% of steps p1<0.5
+// ===== page quality gates (drive server-side auto hi-res) =====
+// CALIBRATED 2026-07-04 on the in-repo corpus vs gundam pseudo-CER (tools/conf_eval.py, outputs_conf/):
+// p10 (10th-percentile token prob) separates bad pages far better than mean conf — all 50 pages with
+// pseudo-CER>0.15 have p10<=0.839 (the old conf<0.80||lowf>0.20 gate MISSED 35 of them: base reads
+// small print confidently-but-wrong, mean stays high); clean pages sit at p10>=0.96. Threshold 0.85
+// catches 50/50 with 0 false escalations on clean docs. Degeneration check stays: confident loops
+// (conf 0.98) evade ALL logit signals.
+static const float P10_T=0.85f;
 // Repetition/degeneration: a page decoded into a loop (e.g. an incrementing counter) evades exact
 // no-repeat-ngram AND keeps HIGH token confidence. Digit runs -> '#', then flag if 8-word shingles
 // are mostly non-unique. Matches web/index.html degeneratePages().
@@ -1312,12 +1357,16 @@ static bool is_degenerate(const std::string& t){
     for(size_t i=0;i+8<=w.size();i++){ std::string s; for(int k=0;k<8;k++){ s+=w[i+k]; s+=' '; } g.insert(s); }
     return (double)g.size()/(double)(w.size()-7) < 0.35;
 }
-static bool page_flagged(const std::vector<int>& toks,float conf,float lowf){
-    if(conf>0 && (conf<CONF_T || lowf>LOW_T)) return true;       // hesitant hallucination
-    return is_degenerate(ocr_decode_tokens(toks));               // confident loop (conf stays high)
+// Calibrated bad-page risk (0..1, higher = escalate; X-Page-Risk). Two detectors, per the calibration:
+// quantile signal for hesitant/garbled/sparse pages, text signal for confident loops.
+static float page_risk(const PageConf& pc,const std::vector<int>& toks){
+    float r=1.f-pc.p10;
+    if(is_degenerate(ocr_decode_tokens(toks))) r=std::max(r,0.95f);   // confident loop: logit signals stay high
+    return r;
 }
+static bool page_flagged(const std::vector<int>& toks,const PageConf& pc){ return page_risk(pc,toks)>1.f-P10_T; }
 struct QueueSrc final : PageSrc{
-    struct Item{ std::shared_ptr<OcrJob> job; int page; int pdfpage; std::vector<int> toks; float conf=0,lowf=0; int vpp=273; };  // page = job-relative slot; pdfpage = actual page in the PDF
+    struct Item{ std::shared_ptr<OcrJob> job; int page; int pdfpage; std::vector<int> toks; PageConf pc; int vpp=273; };  // page = job-relative slot; pdfpage = actual page in the PDF
     std::unordered_map<int,Item> items; int nid=0;         // live (admittable/in-flight) items only
     std::deque<std::deque<int>> rr;                        // per-job pending page ids, round-robin
     void expand(std::shared_ptr<OcrJob> j){                // job -> items (page count read here, engine thread)
@@ -1332,13 +1381,14 @@ struct QueueSrc final : PageSrc{
         } else { n=total; if(j->npages>0 && j->npages<n) n=j->npages; }
         j->pages=n; j->pending=n; j->page_toks.assign(n,{});
         j->page_conf.assign(n,0.f); j->page_lowfrac.assign(n,0.f); j->pdfpages.assign(n,0);
+        j->page_feats.assign(n,{}); j->page_risk.assign(n,0.f);
         std::deque<int> pend;
         for(int p=0;p<n;p++){ int pdfp=j->pagelist.empty()?p:j->pagelist[p]; j->pdfpages[p]=pdfp;
             int pv=273;
             if(j->gundam){ pv=gundam_page_ntok(j->path.c_str(),pdfp);   // per-page tiling from dims only (no encode)
                 if(pv<0){ j->status=422; j->err="cannot read page "+std::to_string(pdfp+1);
                           vis_doc_close(j->path.c_str()); srv_complete(std::move(j)); return; } }
-            items[nid]=Item{j,p,pdfp,{},0,0,pv}; pend.push_back(nid); nid++; }
+            items[nid]=Item{j,p,pdfp,{},{},pv}; pend.push_back(nid); nid++; }
         rr.push_back(std::move(pend));
     }
     void pump(){ std::shared_ptr<OcrJob> j; while((j=srv_take())) expand(std::move(j)); }
@@ -1379,25 +1429,26 @@ struct QueueSrc final : PageSrc{
         *pidx=0; return scr;
     }
     std::vector<int>& out(int id) override { return items.at(id).toks; }
-    void stats(int id,float c,float lf) override { Item& it=items.at(id); it.conf=c; it.lowf=lf; }
+    void stats(int id,const PageConf& pc) override { items.at(id).pc=pc; }
     void done(int id) override {
         auto node=items.extract(id); Item& it=node.mapped(); std::shared_ptr<OcrJob> j=it.job;
         j->page_toks[it.page]=std::move(it.toks);
-        j->page_conf[it.page]=it.conf; j->page_lowfrac[it.page]=it.lowf;
+        j->page_conf[it.page]=it.pc.conf; j->page_lowfrac[it.page]=it.pc.lowf; j->page_feats[it.page]=it.pc;
         if(--j->pending==0){
             if(j->auto_hires && !j->gundam && !j->retried){   // AUTO HI-RES: re-queue flagged pages as gundam items (co-batched — no interlude, no reenqueue)
                 std::deque<int> pend;
                 for(int i=0;i<j->pages && (int)pend.size()<512;i++){
-                    if(!page_flagged(j->page_toks[i],j->page_conf[i],j->page_lowfrac[i])) continue;
+                    if(!page_flagged(j->page_toks[i],j->page_feats[i])) continue;
                     int pv=gundam_page_ntok(j->path.c_str(),j->pdfpages[i]);
                     if(pv<0) continue;                        // dims unreadable: keep the base result
-                    items[nid]=Item{j,i,j->pdfpages[i],{},0,0,pv}; pend.push_back(nid); nid++;   // page=i -> done() overwrites page_toks[i] = the merge
+                    items[nid]=Item{j,i,j->pdfpages[i],{},{},pv}; pend.push_back(nid); nid++;   // page=i -> done() overwrites page_toks[i] = the merge
                 }
                 if(!pend.empty()){ j->retried=true; j->pending=(int)pend.size(); rr.push_back(std::move(pend)); return; }
             }
             long tk=0; j->truncated=0;                     // recount from final page_toks (retried pages would double-count incrementally)
             for(auto&p:j->page_toks){ if(!p.empty()&&p.back()!=1)j->truncated++; for(int t:p) if(t!=1)tk++; }
             j->tokens=tk;
+            for(int i=0;i<j->pages;i++) j->page_risk[i]=page_risk(j->page_feats[i],j->page_toks[i]);   // calibrated escalation signal (X-Page-Risk)
             vis_doc_close(j->path.c_str());                // spool paths get recycled: never serve a stale doc
             if(g_pf_pdf==j->path) enc_invalidate();
             srv_complete(std::move(j));
@@ -1454,9 +1505,9 @@ int main(int argc,char**argv){
         printf("\n===== OCR (GUNDAM, %d page(s), %d tokens) =====\n%s\n",N,(int)allkeep.size(),bpe_decode(allkeep).c_str());
         return 0;
     }
+    load_vocab("/home/janitor/unlimited-ocr/engine/vocab.bin");  // before decode: line-region confidence features need the newline-token mask
     g_pdf=pdf; g_N=N; enc_invalidate();                       // vision is encoded lazily per admission (enc_base), overlapped CPU render
     std::vector<std::vector<int>> po; generate_pagepar(N,nullptr,po,273,enc_base);   // the only decode path: page-parallel, windowed admission
-    load_vocab("/home/janitor/unlimited-ocr/engine/vocab.bin");
     std::vector<int> keep; for(auto&pg:po) for(int t:pg) if(t!=1) keep.push_back(t);
     printf("\n===== OCR (%d page(s), %d tokens) =====\n%s\n", N, (int)keep.size(), bpe_decode(keep).c_str());
     return 0;

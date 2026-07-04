@@ -647,3 +647,32 @@ last latency tax on co-batched streams. Now it overlaps the decode window — st
   production instance, and the default 32 big slots (+3.7GB/server) can OOM the CLI comparison run.
 - **Gates**: 3 md5 BIT-EXACT, gundam-50 BIT-IDENTICAL, check/lint/servercheck PASS (idle gundam parity =
   byte-exact THROUGH the async pump), sanitizers clean (racecheck: gundam-size infeasible, see above).
+
+## Confidence v2: quantile-gated escalation (2026-07-04)
+The auto-hires trigger was mean-conf<0.80 || lowfrac>0.20 || degeneration. Calibrated against the
+in-repo corpus (67 pages: paper + brochure + mixed_ratio) with GUNDAM output as pseudo-ground-truth
+(word-level pseudo-CER, layout-stripped, isolated single-page inference), that gate MISSED 35 of 50
+materially-bad pages (pseudo-CER>0.15): base reads small print confidently-but-wrong, so the MEAN stays
+high (0.85-0.94). The scorer comparison (tools/conf_eval.py -> outputs_conf/report.md) ran H1-H8 from
+confidence_prompt.md; quantile + window signals win (p10 AUROC 0.995, window-entropy 0.995 vs mean-conf
+0.988); a fitted logistic combo UNDERPERFORMED p10 alone (0.977 — overfit on 32 calibration pages), so
+per the single-engine policy the shipped gate is the simple one.
+- **Instrumentation**: k_conf_b/k_conf_cand_b now write per-slot per-STEP traces (p1 + top-k Shannon
+  entropy from the same softmax pass: H = ln Z - (Σ e^x·x)/Z) instead of atomicAdd sums; still read-only
+  wrt token selection (all md5/gundam-50 gates bit-exact). Features computed host-side at retire
+  (conf_features): mean/lowfrac (back-compat), p10 quantile, 32-token window min-p/max-entropy, worst
+  line-region mean-p (regions split at newline tokens via g_toknl), post-EOS steps excluded. ~10MB traces.
+- **Shipped gate (calibrated)**: page_risk = max(1 - p10, degeneration ? 0.95 : —); escalate at
+  risk > 0.15 (i.e. p10 < P10_T=0.85). On the corpus: 50/50 bad pages caught (old gate: 15/50), 0 false
+  escalations on clean docs (clean p10 >= 0.96, margin 0.11). The two-detector structure is REQUIRED:
+  confident loops decode at conf 0.98 / high p10 and only the text signal sees them; conversely the
+  "confident omission" page (base skips unresolvable small text, p10 0.84) is caught only by p10.
+- **API**: X-Page-Risk header (always; 0..1, escalate>0.15), X-Page-Feats with ?feats=1
+  (p10:wminp:emean:wment:regp:ntok per page — the eval harness feeds on this). X-Page-Conf/LowConf
+  unchanged (conf now cuts at first EOS — post-EOS boundary steps no longer pollute the mean).
+- **Measured end-to-end** (brochure pages 1-8, agreement vs isolated gundam reference): auto=on with the
+  old gate re-ran only p1-2; the new gate re-runs all 8: p5 0.20->0.92, p3 0.54->0.99, p4 0.50->0.94,
+  p6 0.74->0.99, p7 0.82->0.95. Clean paper: 0 escalations. Cost: brochure-class docs escalate fully
+  (correct — they need gundam); clean docs pay nothing.
+- **Label caveat** (also in confidence_prompt.md): pseudo-CER saturates where gundam also fails; one
+  paper page (figure-heavy, p10 0.997) carries a noisy 0.07 label — treated as clean, correctly not escalated.

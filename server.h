@@ -9,6 +9,18 @@
 #include <condition_variable>
 #include <chrono>
 
+// Per-page decode-confidence features (engine thread computes at page retire from per-step traces).
+// All READ-ONLY wrt token selection. p1 = softmax prob of the emitted token; ent = top-k Shannon entropy (nats).
+struct PageConf{
+    float conf=0;      // mean p1 over emitted tokens incl. prefill token (H1 baseline; header back-compat)
+    float lowf=0;      // fraction of tokens with p1<0.5 (header back-compat)
+    float p10=0;       // 10th-percentile p1 (quantile signal: a page is bad if its WORST tokens are bad)
+    float wminp=1;     // min over 32-token sliding windows of window-mean p1 (errors cluster locally)
+    float emean=0;     // mean per-token entropy
+    float wment=0;     // max over 32-token sliding windows of window-mean entropy
+    float regp=1;      // worst line-region mean p1 (regions split at newline tokens, merged to >=24 tokens)
+    int   ntok=0;      // tokens scored (post-EOS steps excluded)
+};
 struct OcrJob{
     // request (connection thread, immutable after enqueue)
     std::string path;                 // spooled PDF (unlinked by the connection thread after completion)
@@ -24,6 +36,9 @@ struct OcrJob{
     std::vector<std::vector<int>> page_toks;  // per page, raw token ids (EOS included; decode via ocr_decode_tokens)
     std::vector<float> page_conf;     // per page: mean top-1 prob of emitted tokens (decode confidence)
     std::vector<float> page_lowfrac;  // per page: fraction of tokens with p1<0.5
+    std::vector<PageConf> page_feats; // per page: full confidence feature vector (X-Page-Feats with ?feats=1)
+    std::vector<float> page_risk;     // per page: calibrated bad-page risk 0..1 (X-Page-Risk; higher = escalate)
+    bool want_feats=false;            // ?feats=1: emit the full feature header (eval harness / power clients)
     int pages=0; int pending=0;       // pending = pages not yet finished (engine-internal)
     long tokens=0; int truncated=0;   // emitted (non-EOS) tokens; pages cut at MAXSTEP without EOS
     // completion handshake
