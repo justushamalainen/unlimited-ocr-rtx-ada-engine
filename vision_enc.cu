@@ -66,16 +66,19 @@ int vis_page_count(const char* pdf){                 // -1 = unreadable
     fz_try(ctx){ n=fz_count_pages(ctx,d); } fz_catch(ctx){ n=-1; }
     return n;
 }
+static void upload_1024(const unsigned char* rgb,int w,int h){  // H2D + letterbox resize-normalize -> g_dimg (VS)
+    if((size_t)w*h*3>g_dsrcn){ if(g_dsrc)cudaFree(g_dsrc); CK(cudaMalloc(&g_dsrc,(size_t)w*h*3)); g_dsrcn=(size_t)w*h*3; }
+    CK(cudaMemcpy(g_dsrc,rgb,(size_t)w*h*3,cudaMemcpyHostToDevice));
+    float sc=fminf((float)IMG/w,(float)IMG/h); int nw=(int)lroundf(w*sc),nh=(int)lroundf(h*sc),offx=(IMG-nw)/2,offy=(IMG-nh)/2;
+    dim3 b(16,16),g((IMG+15)/16,(IMG+15)/16); k_resize_norm<<<g,b>>>(g_dsrc,h,w,nw,nh,offx,offy,g_dimg);
+}
 static bool render_preprocess(const char* pdf,int page,float dpi){  // -> g_dimg; false = render failed
     fz_context* ctx=fzctx(); fz_document* doc=fzdoc(pdf); if(!doc)return false;
     fz_matrix mat=fz_scale(dpi/72.f,dpi/72.f);
     fz_pixmap* pix=nullptr; fz_var(pix);
     fz_try(ctx){ pix=fz_new_pixmap_from_page_number(ctx,doc,page,mat,fz_device_rgb(ctx),0); } fz_catch(ctx){ return false; }
     int w=fz_pixmap_width(ctx,pix),h=fz_pixmap_height(ctx,pix); unsigned char* sm=fz_pixmap_samples(ctx,pix);
-    if((size_t)w*h*3>g_dsrcn){ if(g_dsrc)cudaFree(g_dsrc); CK(cudaMalloc(&g_dsrc,(size_t)w*h*3)); g_dsrcn=(size_t)w*h*3; }
-    CK(cudaMemcpy(g_dsrc,sm,(size_t)w*h*3,cudaMemcpyHostToDevice));
-    float sc=fminf((float)IMG/w,(float)IMG/h); int nw=(int)lroundf(w*sc),nh=(int)lroundf(h*sc),offx=(IMG-nw)/2,offy=(IMG-nh)/2;
-    dim3 b(16,16),g((IMG+15)/16,(IMG+15)/16); k_resize_norm<<<g,b>>>(g_dsrc,h,w,nw,nh,offx,offy,g_dimg);
+    upload_1024(sm,w,h);
     fz_drop_pixmap(ctx,pix);
     return true;
 }
@@ -151,6 +154,91 @@ __global__ void k_biassoftmax(bf16* S,const float* rh,const float* rw,int Bh,int
     if(threadIdx.x==0){float ll=0;for(int i=0;i<(blockDim.x+31)/32;i++)ll+=wl[i];wl[0]=ll;} __syncthreads(); l=wl[0];
     for(int j=threadIdx.x;j<N;j+=blockDim.x)s[j]=f2b(sf[j]/l);
 }
+// SAM attention, FUSED (flash, tensor cores): QK^T + decomposed rel-pos bias + softmax + PV in one
+// kernel — the N x N score matrix (402MB/layer at N=4096) is never materialized. Same partial-softmax
+// structure as the decode/prefill flash kernels: block = (bh, 16-query tile), 4 warps split keys
+// strided, per-warp online softmax, block-level merge. P quantizes to bf16 exactly where the old
+// k_biassoftmax wrote bf16 probs; the final /l runs in fp32 (old path divided in fp32 then stored bf16).
+// DRIFT CLASS vs the cuBLAS+softmax chain (reassociation); vision fixture (GUNDAM_VFIX) is the gate.
+__device__ __forceinline__ void vmma_bf(float* c,const uint32_t* a,uint32_t b0,uint32_t b1){
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+        :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1)); }
+__device__ __forceinline__ uint32_t vpk2(float a,float b){ __nv_bfloat162 t=__floats2bfloat162_rn(a,b); uint32_t u; memcpy(&u,&t,4); return u; }
+__global__ void k_sam_flash(const bf16* q,const bf16* k,const bf16* v,bf16* O,const float* rh,const float* rw,int N,int Hs,float scale){
+    int bh=blockIdx.y, it=blockIdx.x*16, w=threadIdx.x>>5, lane=threadIdx.x&31;
+    int g=lane>>2, t=lane&3;                                 // vision heads: HD=64 -> 4 k-steps, 8 PV n-tiles
+    __shared__ __align__(16) uint32_t sm_[4][1024];          // per-warp 4KB: V^T stage [HD][18] halves, reused as fp32 O[16][HD]
+    __shared__ float sml[4][2][16];
+    bf16* vst=(bf16*)sm_[w];
+    const bf16* qb=q+(size_t)bh*N*HD; const bf16* kb=k+(size_t)bh*N*HD; const bf16* vb=v+(size_t)bh*N*HD;
+    int qi0=it+g, qi1=it+g+8;
+    const float* rh0=rh+((size_t)bh*N+qi0)*Hs; const float* rw0=rw+((size_t)bh*N+qi0)*Hs;
+    const float* rh1=rh+((size_t)bh*N+qi1)*Hs; const float* rw1=rw+((size_t)bh*N+qi1)*Hs;
+    uint32_t qa[HD/16][4];
+    #pragma unroll
+    for(int s8=0;s8<HD/16;s8++){
+        const bf16* q0=qb+(size_t)qi0*HD+s8*16+2*t; const bf16* q1=qb+(size_t)qi1*HD+s8*16+2*t;
+        qa[s8][0]=qi0<N?*(const uint32_t*)q0:0u;     qa[s8][1]=qi1<N?*(const uint32_t*)q1:0u;
+        qa[s8][2]=qi0<N?*(const uint32_t*)(q0+8):0u; qa[s8][3]=qi1<N?*(const uint32_t*)(q1+8):0u;
+    }
+    float m0=-1e30f,m1=-1e30f,l0=0.f,l1=0.f;
+    float oa[HD/8][4]; for(int n=0;n<HD/8;n++){oa[n][0]=oa[n][1]=oa[n][2]=oa[n][3]=0.f;}
+    for(int jb=w*16; jb<N; jb+=64){
+        int nk=min(16,N-jb);
+        __syncwarp();
+        for(int idx=lane; idx<16*(HD/2); idx+=32){ int r=idx/(HD/2), cw=idx%(HD/2);   // V rows -> V^T stage
+            uint32_t val=r<nk?((const uint32_t*)(vb+(size_t)(jb+r)*HD))[cw]:0u;
+            vst[(2*cw)*18+r]=((const bf16*)&val)[0]; vst[(2*cw+1)*18+r]=((const bf16*)&val)[1]; }
+        __syncwarp();
+        float sc0[4]={0,0,0,0},sc1[4]={0,0,0,0};
+        #pragma unroll
+        for(int s8=0;s8<HD/16;s8++){
+            const bf16* k0=kb+(size_t)(jb+g)*HD+s8*16+2*t;
+            const bf16* k1=kb+(size_t)(jb+g+8)*HD+s8*16+2*t;
+            uint32_t b00=jb+g<N?*(const uint32_t*)k0:0u,   b01=jb+g<N?*(const uint32_t*)(k0+8):0u;
+            uint32_t b10=jb+g+8<N?*(const uint32_t*)k1:0u, b11=jb+g+8<N?*(const uint32_t*)(k1+8):0u;
+            vmma_bf(sc0,qa[s8],b00,b01); vmma_bf(sc1,qa[s8],b10,b11);
+        }
+        int j0=jb+2*t, j1=j0+1, j2=j0+8, j3=j1+8;
+        float s00=j0<N?sc0[0]*scale+rh0[j0/Hs]+rw0[j0%Hs]:-1e30f, s01=j1<N?sc0[1]*scale+rh0[j1/Hs]+rw0[j1%Hs]:-1e30f;
+        float s02=j2<N?sc1[0]*scale+rh0[j2/Hs]+rw0[j2%Hs]:-1e30f, s03=j3<N?sc1[1]*scale+rh0[j3/Hs]+rw0[j3%Hs]:-1e30f;
+        float s10=j0<N?sc0[2]*scale+rh1[j0/Hs]+rw1[j0%Hs]:-1e30f, s11=j1<N?sc0[3]*scale+rh1[j1/Hs]+rw1[j1%Hs]:-1e30f;
+        float s12=j2<N?sc1[2]*scale+rh1[j2/Hs]+rw1[j2%Hs]:-1e30f, s13=j3<N?sc1[3]*scale+rh1[j3/Hs]+rw1[j3%Hs]:-1e30f;
+        float rm0=fmaxf(fmaxf(s00,s01),fmaxf(s02,s03)), rm1=fmaxf(fmaxf(s10,s11),fmaxf(s12,s13));
+        rm0=fmaxf(rm0,__shfl_xor_sync(~0u,rm0,1)); rm0=fmaxf(rm0,__shfl_xor_sync(~0u,rm0,2));
+        rm1=fmaxf(rm1,__shfl_xor_sync(~0u,rm1,1)); rm1=fmaxf(rm1,__shfl_xor_sync(~0u,rm1,2));
+        float mn0=fmaxf(m0,rm0), mn1=fmaxf(m1,rm1), cr0=__expf(m0-mn0), cr1=__expf(m1-mn1); m0=mn0; m1=mn1;
+        float p00=__expf(s00-mn0),p01=__expf(s01-mn0),p02=__expf(s02-mn0),p03=__expf(s03-mn0);
+        float p10=__expf(s10-mn1),p11=__expf(s11-mn1),p12=__expf(s12-mn1),p13=__expf(s13-mn1);
+        float sp0=p00+p01+p02+p03, sp1=p10+p11+p12+p13;
+        sp0+=__shfl_xor_sync(~0u,sp0,1); sp0+=__shfl_xor_sync(~0u,sp0,2);
+        sp1+=__shfl_xor_sync(~0u,sp1,1); sp1+=__shfl_xor_sync(~0u,sp1,2);
+        l0=l0*cr0+sp0; l1=l1*cr1+sp1;
+        uint32_t pa[4]={vpk2(p00,p01),vpk2(p10,p11),vpk2(p02,p03),vpk2(p12,p13)};
+        #pragma unroll
+        for(int n=0;n<HD/8;n++){
+            oa[n][0]*=cr0; oa[n][1]*=cr0; oa[n][2]*=cr1; oa[n][3]*=cr1;
+            uint32_t b0=*(const uint32_t*)(vst+(size_t)(n*8+g)*18+2*t), b1=*(const uint32_t*)(vst+(size_t)(n*8+g)*18+2*t+8);
+            vmma_bf(oa[n],pa,b0,b1);
+        }
+    }
+    __syncwarp();
+    float* ow=(float*)sm_[w];
+    #pragma unroll
+    for(int n=0;n<HD/8;n++){
+        ow[g*HD+n*8+2*t]=oa[n][0]; ow[g*HD+n*8+2*t+1]=oa[n][1];
+        ow[(g+8)*HD+n*8+2*t]=oa[n][2]; ow[(g+8)*HD+n*8+2*t+1]=oa[n][3];
+    }
+    if(t==0){ sml[w][0][g]=m0; sml[w][1][g]=l0; sml[w][0][g+8]=m1; sml[w][1][g+8]=l1; }
+    __syncthreads();
+    for(int idx=threadIdx.x; idx<16*HD; idx+=128){           // merge the 4 warps' partial softmaxes
+        int r=idx/HD, c=idx%HD; int qi=it+r; if(qi>=N) continue;
+        float mg=-1e30f; for(int ww=0;ww<4;ww++) mg=fmaxf(mg,sml[ww][0][r]);
+        float lg=0,acc=0;
+        for(int ww=0;ww<4;ww++){ float f=__expf(sml[ww][0][r]-mg); lg+=sml[ww][1][r]*f; acc+=((float*)sm_[ww])[r*HD+c]*f; }
+        O[((size_t)bh*N+qi)*HD+c]=__float2bfloat16(acc/lg);
+    }
+}
 __global__ void k_mergeheads(const bf16* O,bf16* out,int B,int N,int Nh){
     int token=blockIdx.x, c=threadIdx.x, h=blockIdx.y; int b=token/N, qi=token%N;
     out[(size_t)token*C + h*HD+c]=O[((size_t)(b*Nh+h)*N+qi)*HD+c];
@@ -204,10 +292,7 @@ static void sam_attn(bf16* x,int B,int N,int Hs,Blk& bl,const float* rh,const fl
     dim3 sg(B*N,NH); k_splitqkv<<<sg,HD>>>(g_qkv,g_q,g_k,g_v,B,N,NH,bl.qkvb);
     size_t rsh=((size_t)Hs*HD + Hs*HD + (2*Hs-1)*HD)*sizeof(float);
     k_relpos<<<dim3(Hs,Bh),256,rsh>>>(g_q,rh,rw,g_rh,g_rw,Bh,N,Hs,Hs);
-    // explicit cuBLAS qk^T -> bias+softmax -> Sv (beats hand-written flash here: cuBLAS tiles K/V optimally)
-    CB(cublasGemmStridedBatchedEx(CUB,CUBLAS_OP_T,CUBLAS_OP_N,N,N,HD,&ONE_,g_k,CUDA_R_16BF,HD,(long long)N*HD,g_q,CUDA_R_16BF,HD,(long long)N*HD,&ZERO_,g_S,CUDA_R_16BF,N,(long long)N*N,Bh,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
-    dim3 bg(N,Bh); k_biassoftmax<<<bg,256,(size_t)N*sizeof(float)>>>(g_S,g_rh,g_rw,Bh,N,Hs,Hs,1.f/sqrtf((float)HD));
-    CB(cublasGemmStridedBatchedEx(CUB,CUBLAS_OP_N,CUBLAS_OP_N,HD,N,N,&ONE_,g_v,CUDA_R_16BF,HD,(long long)N*HD,g_S,CUDA_R_16BF,N,(long long)N*N,&ZERO_,g_O,CUDA_R_16BF,HD,(long long)N*HD,Bh,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+    k_sam_flash<<<dim3((N+15)/16,Bh),128>>>(g_q,g_k,g_v,g_O,g_rh,g_rw,N,Hs,1.f/sqrtf((float)HD));   // fused QK^T+bias+softmax+PV (no N x N score matrix)
     dim3 mg(B*N,NH); k_mergeheads<<<mg,HD>>>(g_O,g_t2,B,N,NH);
     linear(B*N,C,C,g_t2,bl.projw,bl.projb,x);
 }
@@ -595,29 +680,96 @@ __global__ void k_gundam_tiles(const unsigned char* src,int sw,int w,float* out)
     int row=p/w, col=p%w; int sy=row*640+y, sx=col*640+x;
     out[((size_t)(p*3+c)*640+y)*640+x]=src[((size_t)sy*sw+sx)*3+c]/127.5f-1.f;
 }
+static void upload_tiles(const unsigned char* rgb,int w,int h,int gw,int gh){  // H2D + tile split -> g_tilesf (VS)
+    g_gw=gw; g_gh=gh; g_gP=gw*gh;
+    if((size_t)w*h*3>g_dtilesn){ if(g_dtiles)cudaFree(g_dtiles); CK(cudaMalloc(&g_dtiles,(size_t)w*h*3)); g_dtilesn=(size_t)w*h*3; }
+    CK(cudaMemcpyAsync(g_dtiles,rgb,(size_t)w*h*3,cudaMemcpyHostToDevice,VS));
+    if(!g_tilesf) CK(cudaMalloc(&g_tilesf,(size_t)32*3*640*640*4));
+    size_t TOT=(size_t)g_gP*3*640*640; k_gundam_tiles<<<(TOT+255)/256,256,0,VS>>>(g_dtiles,w,g_gw,g_tilesf);
+}
 static bool gundam_render(const char* pdf,int page){
     fz_context* ctx=fzctx(); fz_document* doc=fzdoc(pdf); if(!doc)return false;
     fz_page* pg=nullptr; fz_pixmap* pix=nullptr; fz_var(pg); fz_var(pix);
+    int gw,gh;
     fz_try(ctx){
         pg=fz_load_page(ctx,doc,page); fz_rect r=fz_bound_page(ctx,pg); float pw=r.x1-r.x0, ph=r.y1-r.y0;
-        gundam_ratio(pw,ph,&g_gw,&g_gh); g_gP=g_gw*g_gh; int SW=640*g_gw, SH=640*g_gh;
+        gundam_ratio(pw,ph,&gw,&gh); int SW=640*gw, SH=640*gh;
         fz_matrix mat=fz_scale((float)SW/pw,(float)SH/ph);                            // anisotropic -> exact (SW,SH)
         pix=fz_new_pixmap_from_page(ctx,pg,mat,fz_device_rgb(ctx),0);
     } fz_catch(ctx){ if(pg)fz_drop_page(ctx,pg); return false; }
     int w=fz_pixmap_width(ctx,pix),h=fz_pixmap_height(ctx,pix); unsigned char* sm=fz_pixmap_samples(ctx,pix);
-    if((size_t)w*h*3>g_dtilesn){ if(g_dtiles)cudaFree(g_dtiles); CK(cudaMalloc(&g_dtiles,(size_t)w*h*3)); g_dtilesn=(size_t)w*h*3; }
-    CK(cudaMemcpyAsync(g_dtiles,sm,(size_t)w*h*3,cudaMemcpyHostToDevice,VS));
-    if(!g_tilesf) CK(cudaMalloc(&g_tilesf,(size_t)32*3*640*640*4));
-    size_t TOT=(size_t)g_gP*3*640*640; k_gundam_tiles<<<(TOT+255)/256,256,0,VS>>>(g_dtiles,w,g_gw,g_tilesf);
+    upload_tiles(sm,w,h,gw,gh);
     fz_drop_pixmap(ctx,pix); fz_drop_page(ctx,pg);                                    // safe: pageable-src cudaMemcpyAsync returns only after staging
     return true;
+}
+// ---- gundam raster worker (CLI admission pipeline): CPU rasters of the NEXT page run on their own
+// thread with their OWN fz_context/doc (MuPDF ctx is not thread-safe; same aa level -> pixels
+// bit-identical to the engine-thread renderer). Staging is SEPARATE from the base-mode prefetch
+// (g_hostrgb). The prefetched path feeds the exact same upload_1024/upload_tiles ops the inline
+// render path uses -> GPU work identical, only the raster timing moves. Marker keyed by (pdf,page),
+// consumed on upload; only the worker writes staging, and the async/join protocol orders access.
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+static std::vector<unsigned char> g_p1rgb,g_ptrgb; static int g_p1w,g_p1h,g_ptw,g_pth,g_pgw,g_pgh;
+static std::string g_gpf_pdf; static int g_gpf_page=-1;
+static bool graster(fz_context* ctx,fz_document* doc,int page){   // rasters page into staging (any thread, own ctx)
+    { fz_pixmap* pix=nullptr; fz_var(pix);
+      fz_matrix mat=fz_scale(120.f/72.f,120.f/72.f);
+      fz_try(ctx){ pix=fz_new_pixmap_from_page_number(ctx,doc,page,mat,fz_device_rgb(ctx),0); } fz_catch(ctx){ return false; }
+      g_p1w=fz_pixmap_width(ctx,pix); g_p1h=fz_pixmap_height(ctx,pix);
+      unsigned char* sm=fz_pixmap_samples(ctx,pix); g_p1rgb.assign(sm,sm+(size_t)g_p1w*g_p1h*3); fz_drop_pixmap(ctx,pix); }
+    { fz_page* pg=nullptr; fz_pixmap* pix=nullptr; fz_var(pg); fz_var(pix);
+      fz_try(ctx){ pg=fz_load_page(ctx,doc,page); fz_rect r=fz_bound_page(ctx,pg); float pw=r.x1-r.x0, ph=r.y1-r.y0;
+          gundam_ratio(pw,ph,&g_pgw,&g_pgh); int SW=640*g_pgw, SH=640*g_pgh;
+          fz_matrix mat=fz_scale((float)SW/pw,(float)SH/ph);
+          pix=fz_new_pixmap_from_page(ctx,pg,mat,fz_device_rgb(ctx),0);
+      } fz_catch(ctx){ if(pg)fz_drop_page(ctx,pg); return false; }
+      g_ptw=fz_pixmap_width(ctx,pix); g_pth=fz_pixmap_height(ctx,pix);
+      unsigned char* sm=fz_pixmap_samples(ctx,pix); g_ptrgb.assign(sm,sm+(size_t)g_ptw*g_pth*3);
+      fz_drop_pixmap(ctx,pix); fz_drop_page(ctx,pg); }
+    return true;
+}
+static std::mutex& g_rmu=*new std::mutex; static std::condition_variable& g_rcv=*new std::condition_variable;  // immortal: a detached worker still waits on them at exit (destructor would hang)
+static std::string& g_rpdf=*new std::string; static int g_rpage=-1; static bool g_rbusy=false,g_rok=false; static bool g_rup=false;
+static void raster_worker(){
+    fz_context* ctx=fz_new_context(NULL,NULL,FZ_STORE_DEFAULT); fz_register_document_handlers(ctx);
+    fz_set_aa_level(ctx,2);                                       // MUST match fzctx(): aa level changes pixels
+    std::string dpath; fz_document* doc=nullptr;
+    for(;;){
+        std::unique_lock<std::mutex> lk(g_rmu);
+        g_rcv.wait(lk,[]{return g_rbusy;});
+        std::string pdf=g_rpdf; int page=g_rpage; lk.unlock();
+        if(!doc || dpath!=pdf){ if(doc)fz_drop_document(ctx,doc); doc=nullptr; dpath=pdf;
+            fz_try(ctx){ doc=fz_open_document(ctx,pdf.c_str()); } fz_catch(ctx){ doc=nullptr; } }
+        bool ok = doc && graster(ctx,doc,page);
+        lk.lock();
+        if(ok){ g_gpf_pdf=pdf; g_gpf_page=page; } else g_gpf_page=-1;
+        g_rok=ok; g_rbusy=false; lk.unlock(); g_rcv.notify_all();
+    }
+}
+void gundam_render_cpu_async(const char* pdf,int page){           // kick the worker (must be idle: async/join pairs)
+    { std::lock_guard<std::mutex> lk(g_rmu);
+      if(!g_rup){ std::thread(raster_worker).detach(); g_rup=true; }
+      g_rpdf=pdf; g_rpage=page; g_rok=false; g_rbusy=true; }
+    g_rcv.notify_all();
+}
+bool gundam_render_cpu_join(){                                    // wait for the in-flight raster; true = staged
+    std::unique_lock<std::mutex> lk(g_rmu);
+    g_rcv.wait(lk,[]{return !g_rbusy;});
+    return g_rok;
 }
 // Async split (heterogeneous-window admission): begin() launches render+SAM/CLIP/assemble on VS and
 // records a completion event — the engine keeps replaying decode graphs on its own stream meanwhile.
 // g_gundam stays valid until the NEXT begin(). ready() polls; wait() blocks (idle windows).
 static cudaEvent_t g_gev=nullptr;
 int gundam_encode_begin(const char* pdf,int page){                                    // ntok, or -1 = render failed
-    init_vision(); if(!render_preprocess(pdf,page,120.f))return -1; if(!gundam_render(pdf,page))return -1;
+    init_vision();
+    if(g_gpf_page==page && g_gpf_pdf==pdf){              // prefetched rasters: upload only (same ops as inline render)
+        upload_1024(g_p1rgb.data(),g_p1w,g_p1h);
+        upload_tiles(g_ptrgb.data(),g_ptw,g_pth,g_pgw,g_pgh);
+        g_gpf_page=-1;                                   // consumed
+    } else { if(!render_preprocess(pdf,page,120.f))return -1; if(!gundam_render(pdf,page))return -1; }
     int nt=gundam_assemble(g_dimg,g_tilesf,g_gw,g_gh,g_gP);
     if(!g_gev) CK(cudaEventCreateWithFlags(&g_gev,cudaEventDisableTiming));
     CK(cudaEventRecord(g_gev,VS)); return nt;

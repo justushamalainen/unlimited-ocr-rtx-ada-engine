@@ -696,3 +696,77 @@ post-transform size).
   (agreement vs isolated gundam refs identical to the retry flow); paper: all-base, 0 false escalations.
   servercheck gained a pre-check stanza (brochure=g,g / paper=b,b). CLI untouched (FixedSrc never
   prechecks) — md5 gates bit-exact; idle base parity holds because the paper passes the precheck.
+
+## Gundam pass optimization: prefill attention rewrite + pipelined admission (2026-07-04)
+Profiled the full gundam-50 pass (testdata/reaktor_mkt.pdf, KV=fp8 build) with nsys/ncu: e2e 33.0s =
+admission 19.7s (vision GPU 11.1s + prefill GPU 6.5s + CPU-raster idle ~2.5s) + decode 13.3s. Decode's
+k_attn_split_b (67% of an NA=50 step) is AT the DRAM roofline (415MB KV read/launch, ncu 83-90% DRAM,
+L2 hit 3.5%) — no accuracy-neutral headroom there; the KV traffic itself is the floor. The reducible
+pieces were prefill attention (compute kernel far from hardware capability) and admission scheduling.
+Shipped, all BIT-EXACT (3 md5 gates + gundam-50 md5 5ef0a9eaa7b8dc33dfac12a84279d721 identical):
+- **k_attn_prefill rewrite** (was 4.2s/50pg = 65% of prefill GPU; ncu: 97% SM issue-saturated, 98%
+  occupancy, L2-resident): (1) 2 queries per block share every K/V row load (per-query FP chain
+  unchanged — same strided key subsequence per warp, same online-softmax update order); (2) exactly one
+  __expf per (key,query) instead of two, via the exp(0)==1.0f identities: new-max path pe=1 ->
+  a=__fmaf_rn(a,cr,v) (RN(1*v)==v); no-new-max path cr=1 -> a+=__fmul_rn(pe,v) (mul-by-1.0 exact, and
+  FFMA(a,1,t)==FADD(a,t)). __fmul_rn/__fmaf_rn PIN the baseline mul->fma contraction — a plain
+  a+=pe*v would re-contract into one FMA and round differently (SASS-verified before writing the
+  branch: baseline is t=FMUL(pe,v); FFMA(a,cr,t)). Branches are warp-uniform (score fully
+  butterfly-reduced). Result: prefill 6.5 -> ~4.0s GPU; admission 19.7 -> 17.2s. Base prefill gets the
+  same win (112pg admission 5.0s, TTFT 348ms).
+- **Pipelined gundam admission** (CLI path; depth 1, host never blocks on VS): raster of page k+1 runs
+  on a dedicated worker thread with its OWN fz_context (aa level 2 mirrored — aa changes pixels!);
+  page k's encode result is copied to its slot ASYNC on VS and prefill's read is gated by a VS->GS
+  cudaStreamWaitEvent instead of a host wait; page k+1's encode launches on VS before prefill(k) runs
+  on GS. gundam_encode_begin consumes the worker's staged rasters through the same upload_1024/
+  upload_tiles ops as the inline path (pixels + GPU op order identical -> bit-exact; only idle moves).
+  Pacing = begin's sync upload copy on VS (back-pressures on the prior encode). Cost: CLI gundam TTFT
+  +~290ms (begin(1) drains encode(0) before prefill(0) — inherent to launching ahead). Gotcha: a
+  detached worker + static condvar/mutex = exit-time hang (pthread_cond_destroy with a live waiter);
+  the sync objects are intentionally immortalized (*new, never destroyed).
+- Net: gundam-50 33.0 -> 30.3s (-8%), decode untouched at 4.26k tok/s, 112pg base 18.2k tok/s
+  unchanged, memcheck clean, servercheck fully green (QueueSrc/server path structurally untouched:
+  the prefetch branch in gundam_encode_begin is inert without the worker marker).
+Remaining accuracy-neutral headroom is small: admission is GPU-compute-bound (vision 11.1s at the bf16
+roofline + prefill ~4.0s), ~1.4s of host launch-storm exposure would need CUDA-graphing the gundam
+encode (~2600 launches/page). The big levers left are all DRIFT-CLASS (need sign-off + measurement):
+tensor-core flash prefill attention (est -2.5s more), SAM fused/flash global attention (kills
+k_biassoftmax+k_relpos 3.25s + GEMM traffic), int4 KV cache (halves the decode DRAM floor, est -3.5s;
+highest accuracy risk — fp8 activation precedents all degraded small text).
+
+## Tensor-core attention rewrites (2026-07-04, DRIFT-CLASS, SIGNED OFF same day): prefill flash + SAM fused
+User-approved drift-class round after the bit-exact one ("lets do these changes and check how they work").
+Both use the same mma m16n8k16 bf16->fp32 flash structure: block = (head, 16-query tile), 4 warps split
+keys strided with PRIVATE online softmax each, block merges the 4 partials (m,l,O) at the end (the decode
+split-K merge shape). P feeds the PV mma straight from the QK C-fragments (the m16n8 C mapping of two
+adjacent n8 tiles IS the m16k16 A mapping — no shared round-trip); V is staged transposed in shared
+([chan][key], pad 18) so PV B-fragments are aligned u32 loads.
+- **k_attn_prefill (LM prefill)**: replaced the scalar 2-query kernel (97% SM issue-saturated, 7ms/layer
+  at S=3118). HD=128: 8 QK k-steps, 16 PV n-tiles, K B-frags read from global (L2-resident per head).
+  Standalone A/B vs the scalar algorithm: max_abs 1 bf16 ULP (0.0078), zero outliers over S in
+  {1,17,64,278,3105,3118,3120}. gundam-50 admission 16.7 -> 14.1s, e2e -3.0s; base 14pg prefill 877ms.
+- **k_sam_flash (vision)**: replaced [cuBLAS QK^T -> k_biassoftmax -> cuBLAS SV] in sam_attn — the
+  N x N bf16 score matrix (402MB/layer at N=4096 global) is never materialized. Decomposed rel-pos bias
+  added in-kernel from the precomputed rh/rw (k_relpos STAYS — now the top remaining vision kernel,
+  ~29ms/page, tensor-core-able later). HD=64 geometry (SAM/CLIP heads!). P quantizes to bf16 exactly
+  where the old path stored bf16 probs; final /l in fp32. GUNDAM_VFIX mean_abs 0.00312 -> 0.00308
+  (marginally CLOSER to HF). e2e ~-0.6s.
+- **Quality adjudication method (important precedent)**: raw output-vs-output diffs on the W=50 CLI run
+  CONFOUND kernel drift with co-batch composition cascade (one page retiring earlier shifts NA for all ->
+  documented near-tie amplification; both builds just sample that distribution). The controlled protocol:
+  idle server at GSLOTS=8, per-page X-Page-Feats — L1 alone: 46/50 pages word-identical, mean p10
+  0.716->0.715, same 45 escalations, words 12112->12114. L1+L2 final: mean p10 0.716->0.724, conf
+  0.932->0.934, same escalation set; page-level word swings on the doc's KNOWN-BAD pages (33/44/45)
+  re-tested ISOLATED (?pages=44%2C45): 610->618 / 660->662 words = pure composition variance (page 33 =
+  the doc's worst page in both builds; baseline hit the 4096 cap on it, p10 ~0.52-0.55 both).
+- Perf ledger 2026-07-04 (gundam-50 brochure, KV=fp8, idle GPU): 33.0s (session start) -> 30.3s
+  (bit-exact: prefill-attn instr diet + admission pipeline) -> 27.3s (L1) -> 26.7s (L1+L2). Decode
+  13.2s (attn at DRAM floor), admission ~13.5s (vision 8.5 GPU + prefill ~2.3 + raster/launch).
+  112pg base 17.9-18.2k tok/s, TTFT 349ms (unchanged); 14pg 4.15k tok/s.
+- **NEW GATE BASELINES (user SIGNED OFF 2026-07-04; CLAUDE.md carries them now. Old values for
+  archaeology: base-1pg 84c6420eb425407ec2ac9dd8932572fd, gundam-1pg d4c62427be467f8a0db13432aee7e7a7,
+  base-14pg af3a8ae8e348d6b2104b3544363b4f37, gundam-50 pre-drift 5ef0a9eaa7b8dc33dfac12a84279d721)**:
+  base-1pg 4ec704f115e83ce7b0ba1b5823a17a34, gundam-1pg f1d4c0a7c960037a1fad92366de4ade4,
+  base-14pg 23427d98281938e49851e164d118bea0, gundam-50 180a6042ec8cafa79e5aa09384d1e42d.
+  memcheck clean (base+gundam), servercheck FULLY GREEN on the new build (parity stanzas are
+  same-binary; agreement/no-HOL/auto-hires unaffected).

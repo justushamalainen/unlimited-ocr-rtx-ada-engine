@@ -40,6 +40,7 @@ __device__ __forceinline__ kvt  kvst(float x){ return __float2bfloat16(x); }
 #define KV_NAME "bf16"
 #endif
 static const int H=1280, NH=10, HD=128, NEXP=64, TOPK=6, MOEI=896, SHI=1792, DENSEI=6848, NL=12, V=129280;
+static const size_t KVTOKE=(size_t)H;           // kvt elements per token row of the KV pool
 static const int WIN=128;  // R-SWA sliding window (config sliding_window_size)
 static const float EPS=1e-6f, ROPE_THETA=10000.f;
 
@@ -248,30 +249,93 @@ __global__ void k_rope(bf16* q,bf16* k,int S,int pos0){
         x[base+d]=__float2bfloat16(a*c-b*s); x[base+d+HD/2]=__float2bfloat16(b*c+a*s); };
     rot(q); rot(k);
 }
-// prefill attention: causal, flash-style. q,k,v [S,NH,HD]. one block per (h, query i), 8 warps split keys.
+// prefill attention: causal flash, TENSOR CORES (mma m16n8k16 bf16 x bf16 -> fp32 accum).
+// Block = (head, 16-query tile), 128 threads = 4 warps; warp w owns key chunks [64c+16w, 64c+16w+16)
+// (strided, disjoint) and runs its OWN online softmax over its subsequence; the block merges the four
+// partials (m,l,O) at the end — same partial-softmax merge shape as the decode split kernel. P (=exp of
+// the score fragment) feeds the PV mma directly from the QK C-fragment registers (flash-2 layout trick:
+// the m16n8 C mapping of two adjacent n8 tiles IS the m16k16 A mapping). V is staged TRANSPOSED in
+// shared ([chan][key], padded) so PV B-fragments are aligned u32 loads; K B-fragments read straight
+// from global (L2-resident: one head's K is ~800KB, re-read per query tile). DRIFT CLASS: fp32-accum
+// tensor cores + bf16 P quantization reassociate vs the scalar kernel (near-tie token flips only);
+// replaced the scalar 2-query kernel 2026-07-04 (see DESIGN.md "Gundam pass optimization" + git history).
+__device__ __forceinline__ void mma_bf(float* c,const uint32_t* a,uint32_t b0,uint32_t b1){
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+        :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1)); }
+__device__ __forceinline__ uint32_t pk2(float a,float b){ __nv_bfloat162 t=__floats2bfloat162_rn(a,b); uint32_t u; memcpy(&u,&t,4); return u; }
 __global__ void k_attn_prefill(const bf16* q,const bf16* k,const bf16* v,bf16* out,int S){
-    int h=blockIdx.x, i=blockIdx.y, tid=threadIdx.x, w=tid>>5, lane=tid&31; if(i>=S)return;
-    int clen=i+1; float scale=rsqrtf((float)HD);
-    __shared__ float qs[HD], sm[8], sl[8], sacc[8][HD];
-    size_t qb=((size_t)i*NH+h)*HD;
-    for(int x=tid;x<HD;x+=blockDim.x) qs[x]=__bfloat162float(q[qb+x]);
+    int h=blockIdx.x, it=blockIdx.y*16, w=threadIdx.x>>5, lane=threadIdx.x&31;
+    int g=lane>>2, t=lane&3;                             // quad row-group / col-pair of the mma fragments
+    __shared__ __align__(16) uint32_t sm_[4][2048];      // per-warp 8KB: V^T stage [128][18] halves, reused as fp32 O[16][128] for the merge
+    __shared__ float sml[4][2][16];                      // per-warp per-row m,l partials
+    bf16* vst=(bf16*)sm_[w];
+    int qi0=it+g, qi1=it+g+8;                            // this thread's two query rows
+    uint32_t qa[8][4];                                   // Q A-fragments, 8 k-steps of 16 channels
+    #pragma unroll
+    for(int s8=0;s8<8;s8++){
+        const bf16* q0=q+((size_t)qi0*NH+h)*HD+s8*16+2*t; const bf16* q1=q+((size_t)qi1*NH+h)*HD+s8*16+2*t;
+        qa[s8][0]=qi0<S?*(const uint32_t*)q0:0u;     qa[s8][1]=qi1<S?*(const uint32_t*)q1:0u;
+        qa[s8][2]=qi0<S?*(const uint32_t*)(q0+8):0u; qa[s8][3]=qi1<S?*(const uint32_t*)(q1+8):0u;
+    }
+    float scale=rsqrtf((float)HD);
+    float m0=-1e30f,m1=-1e30f,l0=0.f,l1=0.f;
+    float oa[16][4]; for(int n=0;n<16;n++){oa[n][0]=oa[n][1]=oa[n][2]=oa[n][3]=0.f;}
+    int imax=min(it+15,S-1);
+    for(int jb=w*16; jb<=imax; jb+=64){
+        int nk=min(16,S-jb);
+        __syncwarp();                                    // prior PV reads done before restaging
+        for(int idx=lane; idx<16*64; idx+=32){ int r=idx>>6, cw=idx&63;   // V rows -> V^T stage
+            uint32_t val=r<nk?((const uint32_t*)(v+((size_t)(jb+r)*NH+h)*HD))[cw]:0u;
+            vst[(2*cw)*18+r]=((const bf16*)&val)[0]; vst[(2*cw+1)*18+r]=((const bf16*)&val)[1]; }
+        __syncwarp();
+        float sc0[4]={0,0,0,0},sc1[4]={0,0,0,0};         // QK fragments: keys jb+0..7, jb+8..15
+        #pragma unroll
+        for(int s8=0;s8<8;s8++){
+            const bf16* k0=k+((size_t)(jb+g)*NH+h)*HD+s8*16+2*t;
+            const bf16* k1=k+((size_t)(jb+g+8)*NH+h)*HD+s8*16+2*t;
+            uint32_t b00=jb+g<S?*(const uint32_t*)k0:0u,     b01=jb+g<S?*(const uint32_t*)(k0+8):0u;
+            uint32_t b10=jb+g+8<S?*(const uint32_t*)k1:0u,   b11=jb+g+8<S?*(const uint32_t*)(k1+8):0u;
+            mma_bf(sc0,qa[s8],b00,b01); mma_bf(sc1,qa[s8],b10,b11);
+        }
+        int j0=jb+2*t, j1=j0+1, j2=j0+8, j3=j1+8;        // fragment columns -> key indices
+        float s00=(j0<=qi0)?sc0[0]*scale:-1e30f, s01=(j1<=qi0)?sc0[1]*scale:-1e30f;   // causal mask (also kills j>=S: qi<=S-1)
+        float s02=(j2<=qi0)?sc1[0]*scale:-1e30f, s03=(j3<=qi0)?sc1[1]*scale:-1e30f;
+        float s10=(j0<=qi1)?sc0[2]*scale:-1e30f, s11=(j1<=qi1)?sc0[3]*scale:-1e30f;
+        float s12=(j2<=qi1)?sc1[2]*scale:-1e30f, s13=(j3<=qi1)?sc1[3]*scale:-1e30f;
+        float rm0=fmaxf(fmaxf(s00,s01),fmaxf(s02,s03)), rm1=fmaxf(fmaxf(s10,s11),fmaxf(s12,s13));
+        rm0=fmaxf(rm0,__shfl_xor_sync(~0u,rm0,1)); rm0=fmaxf(rm0,__shfl_xor_sync(~0u,rm0,2));   // row max across the quad
+        rm1=fmaxf(rm1,__shfl_xor_sync(~0u,rm1,1)); rm1=fmaxf(rm1,__shfl_xor_sync(~0u,rm1,2));
+        float mn0=fmaxf(m0,rm0), mn1=fmaxf(m1,rm1), cr0=__expf(m0-mn0), cr1=__expf(m1-mn1); m0=mn0; m1=mn1;
+        float p00=__expf(s00-mn0),p01=__expf(s01-mn0),p02=__expf(s02-mn0),p03=__expf(s03-mn0);
+        float p10=__expf(s10-mn1),p11=__expf(s11-mn1),p12=__expf(s12-mn1),p13=__expf(s13-mn1);
+        float sp0=p00+p01+p02+p03, sp1=p10+p11+p12+p13;
+        sp0+=__shfl_xor_sync(~0u,sp0,1); sp0+=__shfl_xor_sync(~0u,sp0,2);
+        sp1+=__shfl_xor_sync(~0u,sp1,1); sp1+=__shfl_xor_sync(~0u,sp1,2);
+        l0=l0*cr0+sp0; l1=l1*cr1+sp1;
+        uint32_t pa[4]={pk2(p00,p01),pk2(p10,p11),pk2(p02,p03),pk2(p12,p13)};   // P C-frags == PV A-frag (rows qi0,qi1 x keys 2t..,+8)
+        #pragma unroll
+        for(int n=0;n<16;n++){
+            oa[n][0]*=cr0; oa[n][1]*=cr0; oa[n][2]*=cr1; oa[n][3]*=cr1;
+            uint32_t b0=*(const uint32_t*)(vst+(size_t)(n*8+g)*18+2*t), b1=*(const uint32_t*)(vst+(size_t)(n*8+g)*18+2*t+8);
+            mma_bf(oa[n],pa,b0,b1);
+        }
+    }
+    __syncwarp();                                        // PV reads done before O overwrites the stage region
+    float* ow=(float*)sm_[w];
+    #pragma unroll
+    for(int n=0;n<16;n++){
+        ow[g*128+n*8+2*t]=oa[n][0]; ow[g*128+n*8+2*t+1]=oa[n][1];
+        ow[(g+8)*128+n*8+2*t]=oa[n][2]; ow[(g+8)*128+n*8+2*t+1]=oa[n][3];
+    }
+    if(t==0){ sml[w][0][g]=m0; sml[w][1][g]=l0; sml[w][0][g+8]=m1; sml[w][1][g+8]=l1; }
     __syncthreads();
-    int d0=lane,d1=lane+32,d2=lane+64,d3=lane+96;
-    float q0=qs[d0],q1=qs[d1],q2=qs[d2],q3=qs[d3];
-    float m=-1e30f,l=0,a0=0,a1=0,a2=0,a3=0;
-    for(int j=w;j<clen;j+=8){ const bf16* kj=k+((size_t)j*NH+h)*HD;
-        float p=q0*__bfloat162float(kj[d0])+q1*__bfloat162float(kj[d1])+q2*__bfloat162float(kj[d2])+q3*__bfloat162float(kj[d3]);
-        for(int o=16;o;o>>=1)p+=__shfl_xor_sync(~0u,p,o);
-        float sc=p*scale,mn=fmaxf(m,sc),cr=__expf(m-mn),pe=__expf(sc-mn);
-        const bf16* vj=v+((size_t)j*NH+h)*HD;
-        a0=a0*cr+pe*__bfloat162float(vj[d0]); a1=a1*cr+pe*__bfloat162float(vj[d1]);
-        a2=a2*cr+pe*__bfloat162float(vj[d2]); a3=a3*cr+pe*__bfloat162float(vj[d3]); l=l*cr+pe; m=mn; }
-    if(lane==0){sm[w]=m;sl[w]=l;}
-    sacc[w][d0]=a0; sacc[w][d1]=a1; sacc[w][d2]=a2; sacc[w][d3]=a3;
-    __syncthreads();
-    if(tid<HD){ float mg=-1e30f; for(int ww=0;ww<8;ww++)mg=fmaxf(mg,sm[ww]);
-        float lg=0,o=0; for(int ww=0;ww<8;ww++){float f=__expf(sm[ww]-mg); lg+=sl[ww]*f; o+=sacc[ww][tid]*f;}
-        out[(size_t)i*NH*HD + h*HD + tid]=__float2bfloat16(o/lg); }
+    for(int idx=threadIdx.x; idx<16*128; idx+=128){      // merge the 4 warps' partial softmaxes
+        int r=idx>>7, c=idx&127; int qi=it+r; if(qi>=S) continue;
+        float mg=-1e30f; for(int ww=0;ww<4;ww++) mg=fmaxf(mg,sml[ww][0][r]);
+        float lg=0,acc=0;
+        for(int ww=0;ww<4;ww++){ float f=__expf(sml[ww][0][r]-mg); lg+=sml[ww][1][r]*f; acc+=((float*)sm_[ww])[r*128+c]*f; }
+        out[((size_t)qi*NH+h)*HD+c]=__float2bfloat16(acc/lg);
+    }
 }
 // seed reference KV from bf16 prefill K/V into the pluggable KV format (bf16 round-trip / fp8 quantize)
 __global__ void k_seedkv(kvt* dst,const bf16* src,size_t n){ size_t i=(size_t)blockIdx.x*256+threadIdx.x; if(i<n) dst[i]=kvst(__bfloat162float(src[i])); }
@@ -358,7 +422,7 @@ static void alloc(int S){
     CK(cudaMalloc(&xbuf,sH*2));CK(cudaMalloc(&nbuf,sH*2));CK(cudaMalloc(&q,sH*2));CK(cudaMalloc(&k,sH*2));CK(cudaMalloc(&v,sH*2));CK(cudaMalloc(&att,sH*2));CK(cudaMalloc(&tmp,sH*2));
     CK(cudaMalloc(&mg,(size_t)S*DENSEI*2));CK(cudaMalloc(&mu,(size_t)S*DENSEI*2));CK(cudaMalloc(&mh,(size_t)S*DENSEI*2));
     CK(cudaMalloc(&glog,(size_t)S*NEXP*4));CK(cudaMalloc(&didx,(size_t)S*TOPK*4));CK(cudaMalloc(&dw,(size_t)S*TOPK*4));CK(cudaMalloc(&Yf,sH*4));
-    for(int l=0;l<NL;l++){ CK(cudaMalloc(&kcache[l],(size_t)S*H*sizeof(kvt))); CK(cudaMalloc(&vcache[l],(size_t)S*H*sizeof(kvt))); }
+    for(int l=0;l<NL;l++){ CK(cudaMalloc(&kcache[l],(size_t)S*KVTOKE*sizeof(kvt))); CK(cudaMalloc(&vcache[l],(size_t)S*KVTOKE*sizeof(kvt))); }
 }
 static void mlp_dense(Layer&ly,const bf16* xn,bf16* outY,int S,int interm,bf16* Wg,bf16* Wu,bf16* Wd);
 // MoE/dense block for PREFILL (S>1). Page-parallel decode uses mlp_block_b.
@@ -428,7 +492,7 @@ static void pfctx_alloc(PfCtx& c,int S){
     CK(cudaMalloc(&c.xbuf,sH*2));CK(cudaMalloc(&c.nbuf,sH*2));CK(cudaMalloc(&c.q,sH*2));CK(cudaMalloc(&c.k,sH*2));CK(cudaMalloc(&c.v,sH*2));CK(cudaMalloc(&c.att,sH*2));CK(cudaMalloc(&c.tmp,sH*2));
     CK(cudaMalloc(&c.mg,(size_t)S*DENSEI*2));CK(cudaMalloc(&c.mu,(size_t)S*DENSEI*2));CK(cudaMalloc(&c.mh,(size_t)S*DENSEI*2));
     CK(cudaMalloc(&c.glog,(size_t)S*NEXP*4));CK(cudaMalloc(&c.didx,(size_t)S*TOPK*4));CK(cudaMalloc(&c.dw,(size_t)S*TOPK*4));CK(cudaMalloc(&c.Yf,sH*4));
-    for(int l=0;l<NL;l++){ CK(cudaMalloc(&c.kcache[l],(size_t)S*H*sizeof(kvt))); CK(cudaMalloc(&c.vcache[l],(size_t)S*H*sizeof(kvt))); }
+    for(int l=0;l<NL;l++){ CK(cudaMalloc(&c.kcache[l],(size_t)S*KVTOKE*sizeof(kvt))); CK(cudaMalloc(&c.vcache[l],(size_t)S*KVTOKE*sizeof(kvt))); }
     long tot=(long)S*TOPK; c.gm_cap=tot;                     // gm pools preallocated at PFG size -> no lazy growth in the swapped context
     CK(cudaMalloc(&c.gm_xg,(size_t)tot*H*2));CK(cudaMalloc(&c.gm_gate,(size_t)tot*MOEI*2));CK(cudaMalloc(&c.gm_up,(size_t)tot*MOEI*2));
     CK(cudaMalloc(&c.gm_h,(size_t)tot*MOEI*2));CK(cudaMalloc(&c.gm_og,(size_t)tot*H*2));CK(cudaMalloc(&c.gm_gtok,(size_t)tot*4));CK(cudaMalloc(&c.gm_inv,(size_t)tot*4));
@@ -466,7 +530,7 @@ static void prefill(const int* dids,int S,float* dlogits_last,bool check,std::ve
         k_rope<<<dim3(S,NH),HD/2,0,GS>>>(q,k,S,0);
         k_seedkv<<<((size_t)S*H+255)/256,256,0,GS>>>(kcache[l],k,(size_t)S*H);  // seed reference KV (quantize to KV format)
         k_seedkv<<<((size_t)S*H+255)/256,256,0,GS>>>(vcache[l],v,(size_t)S*H);
-        k_attn_prefill<<<dim3(NH,S),256,0,GS>>>(q,k,v,att,S);
+        k_attn_prefill<<<dim3(NH,(S+15)/16),128,0,GS>>>(q,k,v,att,S);
         lin(att,ly.o,tmp,S,H,H);
         k_add<<<(S*H+255)/256,256,0,GS>>>(xbuf,tmp,S*H);             // residual
         k_rmsnorm<<<S,256,0,GS>>>(xbuf,ly.post_norm,nbuf,S,H,EPS);
@@ -520,10 +584,10 @@ __global__ void k_attn_split_b(const bf16* qkvb,const kvt* kc,const kvt* vc,floa
     if(j0>=j1){ if(lane==0){pm[base]=-1e30f;pl[base]=0;}      // empty split (ns>keys): write NEUTRAL so merge ignores it
         pacc[(size_t)base*HD+d0]=0;pacc[(size_t)base*HD+d1]=0;pacc[(size_t)base*HD+d2]=0;pacc[(size_t)base*HD+d3]=0; return; }
     const bf16* q=qkvb+(size_t)s*3*H+(size_t)h*HD;          // rotated q for (stream s, head h)
-    int ps=act[s]; const kvt* kcs=kc+(size_t)kvoff[ps]*H; const kvt* vcs=vc+(size_t)kvoff[ps]*H;
     float scale=rsqrtf((float)HD);
     float q0=__bfloat162float(q[d0]),q1=__bfloat162float(q[d1]),q2=__bfloat162float(q[d2]),q3=__bfloat162float(q[d3]);
     __shared__ float sf[512]; float m=-1e30f;
+    int ps=act[s]; const kvt* kcs=kc+(size_t)kvoff[ps]*H; const kvt* vcs=vc+(size_t)kvoff[ps]*H;
     #pragma unroll 8
     for(int j=j0;j<j1;j++){ const kvt* kj=kcs+((size_t)j*NH+h)*HD;     // ILP: overlap K loads across iters (latency-bound)
         float p=q0*kvld(kj[d0])+q1*kvld(kj[d1])+q2*kvld(kj[d2])+q3*kvld(kj[d3]);
@@ -971,7 +1035,7 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
     const int PFG=GV?1+GV+4:0, MSG=GV?PFG+WIN:0;
     int G=0;
     if(GV){ size_t freeb=0,totalb=0; cudaMemGetInfo(&freeb,&totalb);            // big-slot count from free VRAM (like vram_wcap)
-        size_t chunk=(size_t)MSG*H*NL*2*sizeof(kvt);                            // K+V all layers, one big slot
+        size_t chunk=(size_t)MSG*KVTOKE*NL*2*sizeof(kvt);                            // K+V all layers, one big slot
         long g=(long)(((double)freeb-3.5e9)/chunk);                             // reserve: PFG prefill scratch + per-slot decode scratch + headroom
         G=(int)std::max(1L,std::min((long)gslots_env(),g)); }
     const int WT=W+G;                                    // slot ids: [0,W) = vpp-shaped, [W,WT) = big
@@ -979,7 +1043,7 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
     std::vector<int> hkvoff(WT),hpf(WT,PF);              // per-slot KV row offset (constant) + ref length (set at admission)
     for(int s=0;s<WT;s++) hkvoff[s]=s<W?s*MS:W*MS+(s-W)*MSG;
     for(int s=W;s<WT;s++) hpf[s]=PFG;
-    for(int l=0;l<NL;l++){ CK(cudaMalloc(&kcb[l],((size_t)W*MS+(size_t)G*MSG)*H*sizeof(kvt))); CK(cudaMalloc(&vcb[l],((size_t)W*MS+(size_t)G*MSG)*H*sizeof(kvt))); }
+    for(int l=0;l<NL;l++){ CK(cudaMalloc(&kcb[l],((size_t)W*MS+(size_t)G*MSG)*KVTOKE*sizeof(kvt))); CK(cudaMalloc(&vcb[l],((size_t)W*MS+(size_t)G*MSG)*KVTOKE*sizeof(kvt))); }
     int *d_pf,*d_kvoff; CK(cudaMalloc(&d_pf,(size_t)WT*4)); CK(cudaMalloc(&d_kvoff,(size_t)WT*4));
     CK(cudaMemcpy(d_pf,hpf.data(),(size_t)WT*4,cudaMemcpyHostToDevice)); CK(cudaMemcpy(d_kvoff,hkvoff.data(),(size_t)WT*4,cudaMemcpyHostToDevice));
     CK(cudaMalloc(&atb_pm,(size_t)WT*NH*NSPLITB*4)); CK(cudaMalloc(&atb_pl,(size_t)WT*NH*NSPLITB*4)); CK(cudaMalloc(&atb_pacc,(size_t)WT*NH*NSPLITB*HD*4));
@@ -1016,8 +1080,8 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
             if(semb){
                 k_pageembeds<<<dim3(PFp,(H+255)/256),256,0,GS>>>(pe,EMB,semb,pidx,0,37460,4366,76466,16,pv);
                 prefill(nullptr,PFp,dlog,false,nullptr,pe);
-                for(int l=0;l<NL;l++){ CK(cudaMemcpyAsync(kcb[l]+(size_t)hkvoff[slot]*H,kcache[l],(size_t)PFp*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS));
-                                       CK(cudaMemcpyAsync(vcb[l]+(size_t)hkvoff[slot]*H,vcache[l],(size_t)PFp*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS)); }
+                for(int l=0;l<NL;l++){ CK(cudaMemcpyAsync(kcb[l]+(size_t)hkvoff[slot]*KVTOKE,kcache[l],(size_t)PFp*KVTOKE*sizeof(kvt),cudaMemcpyDeviceToDevice,GS));
+                                       CK(cudaMemcpyAsync(vcb[l]+(size_t)hkvoff[slot]*KVTOKE,vcache[l],(size_t)PFp*KVTOKE*sizeof(kvt),cudaMemcpyDeviceToDevice,GS)); }
                 std::vector<float> ll(V); CK(cudaMemcpyAsync(ll.data(),dlog,(size_t)V*4,cudaMemcpyDeviceToHost,GS)); CK(cudaStreamSynchronize(GS));  // stream-scoped: don't drain VS (in-flight async encode)
                 int t=0; for(int e=1;e<V;e++) if(ll[e]>ll[t])t=e; src.out(pid).push_back(t); total++;
                 double cz=0,sxe=0; for(int e=0;e<V;e++){ double d=(double)ll[e]-ll[t],ex=exp(d); cz+=ex; sxe+=ex*d; }   // first-token p1+entropy (host; logits already here)
@@ -1052,8 +1116,8 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
                     CK(cudaMemcpyAsync(vis2+H,src.enc_result(),(size_t)ap.pv*H*2,cudaMemcpyDeviceToDevice,GS));   // k_pageembeds expects visual tokens at ROW 1 (slot-local embeds convention)
                     k_pageembeds<<<dim3(PFp,(H+255)/256),256,0,GS>>>(pe2,EMB,vis2,0,0,37460,4366,76466,16,ap.pv);
                     prefill(nullptr,PFp,dlog2,false,nullptr,pe2);
-                    for(int l=0;l<NL;l++){ CK(cudaMemcpyAsync(kcb[l]+(size_t)hkvoff[slot]*H,kcache[l],(size_t)PFp*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS));
-                                           CK(cudaMemcpyAsync(vcb[l]+(size_t)hkvoff[slot]*H,vcache[l],(size_t)PFp*H*sizeof(kvt),cudaMemcpyDeviceToDevice,GS)); }
+                    for(int l=0;l<NL;l++){ CK(cudaMemcpyAsync(kcb[l]+(size_t)hkvoff[slot]*KVTOKE,kcache[l],(size_t)PFp*KVTOKE*sizeof(kvt),cudaMemcpyDeviceToDevice,GS));
+                                           CK(cudaMemcpyAsync(vcb[l]+(size_t)hkvoff[slot]*KVTOKE,vcache[l],(size_t)PFp*KVTOKE*sizeof(kvt),cudaMemcpyDeviceToDevice,GS)); }
                     std::vector<float> ll(V); CK(cudaMemcpyAsync(ll.data(),dlog2,(size_t)V*4,cudaMemcpyDeviceToHost,GS)); CK(cudaStreamSynchronize(GS));
                     pfctx_swap(c2);                                  // back to the decode context
                     int t=0; for(int e=1;e<V;e++) if(ll[e]>ll[t])t=e; src.out(ap.pid).push_back(t); total++;
@@ -1094,7 +1158,7 @@ static void generate_pagepar_core(PageSrc& src,int vpp,int W,int Ntotal){
         bool sm=(na<=PPSMALL);
         for(int l=0;l<NL;l++){ Layer&ly=L[l];
             if(sm) k_gemv_fp8_b<<<GEMVBT(3*H,na),256,0,GS>>>(nbuf,ly.qkv8,ly.qkv_s,qkvbb,na,3*H,H); else lin(nbuf,ly.qkv,qkvbb,na,H,3*H);
-            k_rope_store_b<<<dim3(NH,na),HD/2,0,GS>>>(qkvbb,kcb[l],vcb[l],d_pf,d_steps,d_kvoff,d_act);
+                        k_rope_store_b<<<dim3(NH,na),HD/2,0,GS>>>(qkvbb,kcb[l],vcb[l],d_pf,d_steps,d_kvoff,d_act);
             k_attn_split_b<<<dim3(NH,na,ns),32,0,GS>>>(qkvbb,kcb[l],vcb[l],atb_pm,atb_pl,atb_pacc,d_pf,d_steps,ns,(284+NH*na-1)/(NH*na),d_kvoff,d_act);
             k_attn_merge_b<<<dim3(NH,na),HD,0,GS>>>(atb_pm,atb_pl,atb_pacc,att,ns);
             if(sm) k_gemv_fp8_b<<<GEMVBT(H,na),256,0,GS>>>(att,ly.o8,ly.o_s,tmp,na,H,H); else lin(att,ly.o,tmp,na,H,H);
@@ -1263,7 +1327,7 @@ static void generate_pagepar(int N,bf16* dembeds,std::vector<std::vector<int>>& 
 static int vram_wcap(int vpp){
     size_t freeb=0,totalb=0; cudaMemGetInfo(&freeb,&totalb);
     size_t MS=(size_t)(1+vpp+4)+WIN;
-    size_t per_slot=MS*H*NL*2*sizeof(kvt);              // K+V for all layers, one slot
+    size_t per_slot=MS*KVTOKE*NL*2*sizeof(kvt);              // K+V for all layers, one slot
     long w=(long)((double)freeb*0.55/per_slot);         // leave 45% for scratch (tc_part/lmh/dlogb ~ per-slot) + vision + headroom
     if(w<1)w=1; if(w>window_env())w=window_env();
     return (int)w;
@@ -1294,13 +1358,36 @@ static void enc_base(int p,bf16* dst){                               // encode p
 // (already one-page-at-a-time = flat memory). po gets one token stream per page. false = a page failed.
 extern int gundam_encode(const char* pdf,int page); extern bf16* gundam_result();
 extern int gundam_encode_begin(const char* pdf,int page); extern int gundam_encode_ready(); extern void gundam_encode_wait();
+extern void gundam_render_cpu_async(const char* pdf,int page); extern bool gundam_render_cpu_join();  // raster worker (CPU prefetch)
 extern int gundam_page_ntok(const char* pdf,int page);   // token count from page dims only (no encode)
 extern int vis_page_glyphpx10(const char* pdf,int page); // p25 glyph px at base-1024 scale, x10; -1 = no text layer
 static const char* g_gpdf=nullptr; static const std::vector<int>* g_gpgs=nullptr; static const std::vector<int>* g_gvpps=nullptr;  // enc_gundam callback state
+static int g_gpre=-1,g_gprent=0;                         // page idx whose encode is in flight on VS (+ its ntok)
+// Pipelined admission encode, depth 1, host never blocks on VS: page id's result is copied to its slot
+// ASYNC on VS and prefill's read of it is gated by a VS->GS event (not a host wait); page id+1's raster
+// runs on the worker thread and its encode launches on VS before prefill(id) runs on GS, so raster,
+// encode and prefill of consecutive pages overlap. Per-page pixels, GPU op order and the prefill
+// sequence are identical to the serial path -> output bit-exact; only idle moves off the critical path.
+// Pacing: gundam_encode_begin's upload (sync copy on VS) naturally back-pressures on the prior encode.
 static void enc_gundam(int id,bf16* dst){                // encode gundam page pgs[id] into a slot's reference (vpp=vpps[id])
-    int nt=gundam_encode(g_gpdf,(*g_gpgs)[id]);
+    const int N=(int)g_gpgs->size();
+    if(g_gpre!=id){                                      // cold start (first admission of the doc): raster+launch inline
+        g_gprent=gundam_encode_begin(g_gpdf,(*g_gpgs)[id]);
+        if(g_gprent<0){ fprintf(stderr,"gundam page %d: render failed\n",(*g_gpgs)[id]); exit(1); }   // dims pre-checked -> unreachable
+        g_gpre=id;
+        if(id+1<N) gundam_render_cpu_async(g_gpdf,(*g_gpgs)[id+1]);   // start the raster pipeline
+    }
+    int nt=g_gprent; g_gpre=-1;
     if(nt!=(*g_gvpps)[id]){ fprintf(stderr,"gundam page %d: %d tok != %d (dims drifted mid-stream)\n",(*g_gpgs)[id],nt,(*g_gvpps)[id]); exit(1); }  // dims pre-checked -> unreachable
-    CK(cudaMemcpy(dst,gundam_result(),(size_t)nt*H*2,cudaMemcpyDeviceToDevice));
+    static cudaEvent_t gcp=nullptr; if(!gcp)CK(cudaEventCreateWithFlags(&gcp,cudaEventDisableTiming));
+    CK(cudaMemcpyAsync(dst,gundam_result(),(size_t)nt*H*2,cudaMemcpyDeviceToDevice,cudaStreamPerThread));  // VS-ordered: after this page's encode, before the next one overwrites g_gundam
+    CK(cudaEventRecord(gcp,cudaStreamPerThread));
+    CK(cudaStreamWaitEvent(GS,gcp,0));                   // prefill consumes dst on GS strictly after the copy
+    if(id+1<N && gundam_render_cpu_join()){              // raster(id+1) staged (ran under encode(id)/prefill(id-1))
+        int nt2=gundam_encode_begin(g_gpdf,(*g_gpgs)[id+1]);          // upload + SAM/CLIP on VS: overlaps prefill(id) on GS
+        if(nt2>=0){ g_gpre=id+1; g_gprent=nt2;
+                    if(id+2<N) gundam_render_cpu_async(g_gpdf,(*g_gpgs)[id+2]); }
+    }
 }
 static bool ocr_gundam(const char* pdf,const std::vector<int>& pgs,std::vector<std::vector<int>>& po,
                        std::vector<float>* conf=nullptr,std::vector<float>* lowf=nullptr){
@@ -1309,7 +1396,7 @@ static bool ocr_gundam(const char* pdf,const std::vector<int>& pgs,std::vector<s
     std::vector<int> nts(N); int mx=0;                             // cheap dims-based tiling per page (no encode)
     for(int i=0;i<N;i++){ nts[i]=gundam_page_ntok(pdf,pgs[i]); if(nts[i]<0)return false; mx=std::max(mx,nts[i]); }
     bool uniform=true; for(int i=1;i<N;i++) if(nts[i]!=nts[0]){uniform=false;break;}
-    g_gpdf=pdf; g_gpgs=&pgs; g_gvpps=&nts;                         // WINDOWED: encode+decode stream through vram_wcap slots
+    g_gpdf=pdf; g_gpgs=&pgs; g_gvpps=&nts; g_gpre=-1;              // WINDOWED: encode+decode stream through vram_wcap slots (no stale in-flight encode across docs)
     int wc=vram_wcap(mx);                                          // mixed tilings: slots sized to the doc's largest page, per-slot pf handles the rest
     cudaEvent_t va,vb; cudaEventCreate(&va);cudaEventCreate(&vb); cudaEventRecord(va,0);
     generate_pagepar(N,nullptr,po,mx,enc_gundam,conf,lowf,wc,uniform?nullptr:&nts);

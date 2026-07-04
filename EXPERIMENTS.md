@@ -101,3 +101,33 @@ ref), but output drift vs bf16 was 99.85% on the paper PDF and only 92.4% on the
 (850 vs 868 det els) — consistent with fp8 lm_head/vision degrading small text. Rejected on perf; would
 also have struggled on accuracy. Code deleted in the single-engine consolidation (never committed);
 DESIGN.md "FP8MMA" preserves the full design for a rebuild if NA regimes change.
+
+## Exp-9: k_attn_split_b multi-warp blocks (2026-07-04) — REVERTED (neutral on gundam, -3.6% on base)
+Hypothesis: 1-warp blocks cap Ada at 24 blocks/SM = 50% theoretical occupancy (ncu: 26% achieved at
+NA=6, DRAM 72%), so packing 4 splits per 128-thread block (per-warp FP sequence unchanged, padding
+warps early-exit, sf shrunk 512->256 floats/warp) should lift the small-NA tail toward the roofline.
+Measured: gundam-50 decode UNCHANGED (13.29 vs 13.26s — at NA=50 the kernel is already 83-90% DRAM,
+extra occupancy adds no bandwidth) and base 14pg decode REGRESSED 4135 -> 3985 tok/s (-3.6%): at
+ns=8/NA=14 the 4-warp granularity coarsens scheduling (280 fat blocks vs 1120 slim ones) and doubles
+per-block shared. All gates stayed bit-exact — the revert is purely perf. Lesson: the split kernel's
+occupancy cap only matters where DRAM% is far from roofline AND the grid is small; that regime (NA<=8
+gundam tail) is too small a slice of any real run to pay for hurting the base fast path.
+
+## Exp-10: int4 KV cache, group-of-32 scales (2026-07-04) — REJECTED on accuracy, code removed
+Design (recoverable from this session's git diff if regimes change): per-(token,head) row = 80B
+(64 packed two's-complement nibbles + 4 inline fp32 group scales at +64), KVTOKE=NH*80 bytes/token,
+same single-array alloc/memcpy plumbing; row-wise k_seedkv (32 thr, group absmax butterflies), 32-thread
+k_rope_store_b (thread t owns rope pairs (2t,2t+64),(2t+1,2t+65) -> bytes t,t+32, no nibble RMW), and an
+int4-specific attention lane mapping (lane owns 4 CONTIGUOUS elems = one u16 + one group scale -> 1 load
++ 4 FMA + 1 mul per key; the first cut with the fp8 lane mapping was SLOWER than fp8 — 4 byte loads + 8
+muls turned the DRAM-bound kernel issue-bound, decode 13.2->15.9s).
+Perf (v2 mapping): decode 13.2 -> 11.8s (4853 tok/s), gundam-50 25.2s (-1.6s), kernel 479 -> ~415us at
+NA=50, ncu DRAM 70% / SM 67% (occupancy-capped, more headroom existed). Base 14pg unchanged.
+Accuracy (controlled GSLOTS=8 idle-server, per-page feats vs fp8 baseline): mean p10 0.716 -> 0.689,
+mean conf 0.932 -> 0.927, escalate-grade pages 45 -> 48, TOTAL WORDS -4.3% — systematic content loss
+including CLEAN pages (p10-0.94 page 32: 525->421 words; page 33: 761->504). Same failure signature as
+fp8 lm_head/vision: 4-bit activation precision crushes exactly the dense small text gundam exists for.
+REJECTED per the accuracy-first policy; deleted per the single-engine policy. KV stays fp8-e4m3.
+Lesson: for KV-bound decode the traffic win is real and the kernel-side cost model works (contiguous
+lane mapping matters more than raw bit-width), but K/V activation quantization below 8 bits is not
+quality-neutral for this model on its own target workload.
