@@ -107,6 +107,15 @@ if [ -f "$BROCH" ]; then
   awk "BEGIN{exit !($bt < 15 && $bt+2 < $gt)}" && echo "  OK (base returned well before the gundam job)" || fail "base 1pg took ${bt}s during gundam job (${gt}s) — HOL blocking?"
 else echo "  SKIP (no reaktor_mkt.pdf)"; fi
 
+echo "== pre-decode small-font check (X-Page-Mode: brochure straight to gundam, paper stays base) =="
+if [ -f "$BROCH" ]; then
+  bm=$(curl -sS --max-time 120 --data-binary @"$BROCH" "$U/ocr?pages=2" -D - -o /dev/null | grep -i x-page-mode: | tr -d '\r' | cut -d' ' -f2)
+  pm=$(curl -sS --max-time 120 --data-binary @"$PDF"   "$U/ocr?pages=2" -D - -o /dev/null | grep -i x-page-mode: | tr -d '\r' | cut -d' ' -f2)
+  [ "$bm" = "g,g" ] || fail "brochure pre-check modes: $bm (want g,g)"
+  [ "$pm" = "b,b" ] || fail "paper pre-check modes: $pm (want b,b — false escalation!)"
+  [ $rc -eq 0 ] && echo "  OK (brochure=g,g paper=b,b)"
+else echo "  SKIP (no reaktor_mkt.pdf)"; fi
+
 echo "== mixed-tiling gundam doc decodes in one heterogeneous pass =="
 MIX="$HOME/unlimited-ocr/testdata/mixed_ratio.pdf"   # 3 pages, 3 different gundam tilings (was: sequential fallback)
 if [ -f "$MIX" ]; then

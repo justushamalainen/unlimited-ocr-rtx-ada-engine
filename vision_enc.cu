@@ -640,6 +640,27 @@ int gundam_page_ntok(const char* pdf,int page){                                 
     if(pg)fz_drop_page(ctx,pg);
     return nt;
 }
+// PRE-DECODE small-font check: char-weighted 25th-percentile glyph size (PDF text layer via fz_stext),
+// scaled to the base-mode 1024 letterbox render -> tenths of a pixel. -1 = no text layer / unreadable
+// (scanned docs: caller falls back to base + the post-decode p10 gate). ~10-30ms CPU per page.
+int vis_page_glyphpx10(const char* pdf,int page){
+    fz_context* ctx=fzctx(); fz_document* doc=fzdoc(pdf); if(!doc)return -1;
+    fz_page* pg=nullptr; fz_stext_page* st=nullptr; fz_var(pg); fz_var(st); int out=-1;
+    fz_try(ctx){
+        pg=fz_load_page(ctx,doc,page); fz_rect r=fz_bound_page(ctx,pg);
+        float scale=1024.f/std::max(r.x1-r.x0,r.y1-r.y0);
+        st=fz_new_stext_page_from_page(ctx,pg,nullptr);
+        std::vector<float> sz;
+        for(fz_stext_block* b=st->first_block;b;b=b->next){ if(b->type!=FZ_STEXT_BLOCK_TEXT)continue;
+            for(fz_stext_line* l=b->u.t.first_line;l;l=l->next)
+                for(fz_stext_char* c=l->first_char;c;c=c->next)
+                    if(c->c>' ') sz.push_back(c->size*scale); }        // char-weighted, whitespace skipped
+        if(sz.size()>=20){ std::sort(sz.begin(),sz.end()); out=(int)(sz[sz.size()/4]*10.f); }   // p25; <20 glyphs = no signal
+    } fz_catch(ctx){ out=-1; }
+    if(st)fz_drop_stext_page(ctx,st);
+    if(pg)fz_drop_page(ctx,pg);
+    return out;
+}
 bf16* gundam_result(){ return g_gundam; }
 
 #ifndef OCR_LINK

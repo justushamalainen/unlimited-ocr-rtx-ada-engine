@@ -2,6 +2,7 @@
 // Threading contract: connection threads (server.cpp) do sockets + files + this queue ONLY.
 // The engine thread (engine.cu) is the sole consumer and the only thread that touches CUDA/MuPDF.
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <memory>
@@ -38,6 +39,7 @@ struct OcrJob{
     std::vector<float> page_lowfrac;  // per page: fraction of tokens with p1<0.5
     std::vector<PageConf> page_feats; // per page: full confidence feature vector (X-Page-Feats with ?feats=1)
     std::vector<float> page_risk;     // per page: calibrated bad-page risk 0..1 (X-Page-Risk; higher = escalate)
+    std::vector<uint8_t> page_mode;   // per page: 0=base, 1=gundam (pre-check escalation or auto-hires retry; X-Page-Mode)
     bool want_feats=false;            // ?feats=1: emit the full feature header (eval harness / power clients)
     int pages=0; int pending=0;       // pending = pages not yet finished (engine-internal)
     long tokens=0; int truncated=0;   // emitted (non-EOS) tokens; pages cut at MAXSTEP without EOS

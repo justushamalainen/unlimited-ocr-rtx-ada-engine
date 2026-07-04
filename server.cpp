@@ -260,6 +260,11 @@ static void handle(int fd){
             snprintf(n,sizeof n,"%s%.2f",i?",":"",i<j->page_risk.size()?j->page_risk[i]:0.f); k+=n;
         }
         extra+=c+"\r\n"+l+"\r\n"+k+"\r\n";
+        if(!j->page_mode.empty()){                                   // which mode produced each page (b=base, g=gundam pre-check/retry)
+            std::string md="X-Page-Mode: ";
+            for(size_t i=0;i<j->page_mode.size();i++){ if(i)md+=','; md+=j->page_mode[i]?'g':'b'; }
+            extra+=md+"\r\n";
+        }
         if(j->want_feats && j->page_feats.size()<=512){              // full feature vector per page (?feats=1): p10:wminp:emean:wment:regp:ntok
             std::string ftr="X-Page-Feats: ";
             for(size_t i=0;i<j->page_feats.size();i++){ const PageConf& pc=j->page_feats[i];

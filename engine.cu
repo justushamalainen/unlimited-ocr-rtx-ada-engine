@@ -1295,6 +1295,7 @@ static void enc_base(int p,bf16* dst){                               // encode p
 extern int gundam_encode(const char* pdf,int page); extern bf16* gundam_result();
 extern int gundam_encode_begin(const char* pdf,int page); extern int gundam_encode_ready(); extern void gundam_encode_wait();
 extern int gundam_page_ntok(const char* pdf,int page);   // token count from page dims only (no encode)
+extern int vis_page_glyphpx10(const char* pdf,int page); // p25 glyph px at base-1024 scale, x10; -1 = no text layer
 static const char* g_gpdf=nullptr; static const std::vector<int>* g_gpgs=nullptr; static const std::vector<int>* g_gvpps=nullptr;  // enc_gundam callback state
 static void enc_gundam(int id,bf16* dst){                // encode gundam page pgs[id] into a slot's reference (vpp=vpps[id])
     int nt=gundam_encode(g_gpdf,(*g_gpgs)[id]);
@@ -1365,6 +1366,12 @@ static float page_risk(const PageConf& pc,const std::vector<int>& toks){
     return r;
 }
 static bool page_flagged(const std::vector<int>& toks,const PageConf& pc){ return page_risk(pc,toks)>1.f-P10_T; }
+// PRE-DECODE escalation (calibrated 2026-07-04, same corpus): char-weighted p25 glyph size at the base
+// 1024 render predicts base failure BEFORE any encode/decode — every pseudo-CER>0.15 page with a text
+// layer sits at <=11.6px, every clean page at >=13.1px. Threshold 12px: those pages go STRAIGHT to
+// gundam (skips the doomed base pass, ~2x faster than base+retry at equal quality). No text layer
+// (scans) or borderline -> base first; the post-decode p10 gate stays as the backstop.
+static const int GLYPH_T10=120;
 struct QueueSrc final : PageSrc{
     struct Item{ std::shared_ptr<OcrJob> job; int page; int pdfpage; std::vector<int> toks; PageConf pc; int vpp=273; };  // page = job-relative slot; pdfpage = actual page in the PDF
     std::unordered_map<int,Item> items; int nid=0;         // live (admittable/in-flight) items only
@@ -1381,17 +1388,23 @@ struct QueueSrc final : PageSrc{
         } else { n=total; if(j->npages>0 && j->npages<n) n=j->npages; }
         j->pages=n; j->pending=n; j->page_toks.assign(n,{});
         j->page_conf.assign(n,0.f); j->page_lowfrac.assign(n,0.f); j->pdfpages.assign(n,0);
-        j->page_feats.assign(n,{}); j->page_risk.assign(n,0.f);
+        j->page_feats.assign(n,{}); j->page_risk.assign(n,0.f); j->page_mode.assign(n,0);
         std::deque<int> pend;
         for(int p=0;p<n;p++){ int pdfp=j->pagelist.empty()?p:j->pagelist[p]; j->pdfpages[p]=pdfp;
             int pv=273;
             if(j->gundam){ pv=gundam_page_ntok(j->path.c_str(),pdfp);   // per-page tiling from dims only (no encode)
                 if(pv<0){ j->status=422; j->err="cannot read page "+std::to_string(pdfp+1);
                           vis_doc_close(j->path.c_str()); srv_complete(std::move(j)); return; } }
+            else if(j->auto_hires) pv=-2;                  // PRE-DECODE check pending: decided lazily at first rotation touch
             items[nid]=Item{j,p,pdfp,{},{},pv}; pend.push_back(nid); nid++; }
         rr.push_back(std::move(pend));
     }
     void pump(){ std::shared_ptr<OcrJob> j; while((j=srv_take())) expand(std::move(j)); }
+    void decide(Item& it){                                 // PRE-DECODE escalation: small print never survives base -> straight to gundam
+        it.vpp=273;
+        int g10=vis_page_glyphpx10(it.job->path.c_str(),it.pdfpage);
+        if(g10>=0 && g10<GLYPH_T10){ int pv=gundam_page_ntok(it.job->path.c_str(),it.pdfpage); if(pv>273) it.vpp=pv; }
+    }
     int next(bool bok,bool gok) override {
         pump();                                            // arrivals join the rotation before each admission
         int nq=(int)rr.size();                             // one full rotation; jobs whose next page has no free slot class go to the back
@@ -1399,7 +1412,9 @@ struct QueueSrc final : PageSrc{
             if(rr.empty()) break;
             std::deque<int> q=std::move(rr.front()); rr.pop_front();
             if(q.empty()) continue;
-            bool big=items.at(q.front()).vpp>273;
+            Item& hd=items.at(q.front());
+            if(hd.vpp==-2) decide(hd);                     // lazy: one ~20ms fz_stext per admission touch, amortized
+            bool big=hd.vpp>273;
             if(big?gok:bok){
                 int id=q.front(); q.pop_front();
                 if(!q.empty()) rr.push_back(std::move(q)); // rotate: next admission goes to the next job
@@ -1434,10 +1449,12 @@ struct QueueSrc final : PageSrc{
         auto node=items.extract(id); Item& it=node.mapped(); std::shared_ptr<OcrJob> j=it.job;
         j->page_toks[it.page]=std::move(it.toks);
         j->page_conf[it.page]=it.pc.conf; j->page_lowfrac[it.page]=it.pc.lowf; j->page_feats[it.page]=it.pc;
+        if(it.vpp>273) j->page_mode[it.page]=1;            // decoded in gundam (pre-escalated or retry)
         if(--j->pending==0){
             if(j->auto_hires && !j->gundam && !j->retried){   // AUTO HI-RES: re-queue flagged pages as gundam items (co-batched — no interlude, no reenqueue)
                 std::deque<int> pend;
                 for(int i=0;i<j->pages && (int)pend.size()<512;i++){
+                    if(j->page_mode[i]) continue;             // already gundam-decoded (pre-check): a same-mode re-run can't improve it
                     if(!page_flagged(j->page_toks[i],j->page_feats[i])) continue;
                     int pv=gundam_page_ntok(j->path.c_str(),j->pdfpages[i]);
                     if(pv<0) continue;                        // dims unreadable: keep the base result

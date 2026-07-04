@@ -676,3 +676,23 @@ per the single-engine policy the shipped gate is the simple one.
   (correct — they need gundam); clean docs pay nothing.
 - **Label caveat** (also in confidence_prompt.md): pseudo-CER saturates where gundam also fails; one
   paper page (figure-heavy, p10 0.997) carries a noisy 0.07 label — treated as clean, correctly not escalated.
+
+## Pre-decode escalation: small-font check before any encode/decode (2026-07-04)
+Post-decode gating pays for a doomed base pass before escalating. The PDF text layer predicts that
+failure upfront: char-weighted p25 glyph size at the base 1024 letterbox scale (`vis_page_glyphpx10`,
+fz_stext, ~10-30ms CPU/page). Calibrated on the same corpus/labels: every pseudo-CER>0.15 page with a
+text layer sits at <=11.6px, every clean page at >=13.1px -> threshold 12px (GLYPH_T10=120). It also
+catches the classes the logit gate struggles with (confident omission p34 at 9.7px; mixed_ratio's
+squeezed landscape at 5.6px — show_pdf_page transforms shrink the effective font, and stext reports the
+post-transform size).
+- **Flow**: base-mode auto jobs expand with vpp=-2 ("undecided"); QueueSrc::next() decides lazily at the
+  item's first rotation touch (one fz_stext per admission touch, amortized — a 500-page expand doesn't
+  stall the engine thread). Small-font pages become gundam items BEFORE any encode: no base pass at all.
+  No text layer (scans) / <20 glyphs / borderline -> base first; the post-decode p10 gate remains the
+  backstop. Pages already gundam-decoded are excluded from the auto-hires retry (a same-mode re-run
+  can't improve them). ?auto=0 disables pre+post together; explicit ?gundam=1 bypasses (already gundam).
+- **API**: X-Page-Mode header (b/g per page — which mode produced each page's text).
+- **Measured**: brochure 8pg auto=on: 6.8s straight-to-gundam (was ~15s base+retry), same final quality
+  (agreement vs isolated gundam refs identical to the retry flow); paper: all-base, 0 false escalations.
+  servercheck gained a pre-check stanza (brochure=g,g / paper=b,b). CLI untouched (FixedSrc never
+  prechecks) — md5 gates bit-exact; idle base parity holds because the paper passes the precheck.
